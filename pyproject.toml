@@ -1,0 +1,29 @@
+[project]
+name = "pydeobf"
+version = "0.1.0"
+description = "Static Python deobfuscator (sandboxed bytecode emulation, optional PyLingual decompiler)"
+requires-python = ">= 3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+dependencies = [
+    "xdis>=6.1.4",
+    "pycryptodome>=3.20",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+# Bytecode -> source decompiler (optional; without it layers are written as .pyc + disassembly)
+decompile = ["pylingual @ git+https://github.com/syssec-utd/pylingual@dev"]
+
+[project.scripts]
+pydeobf = "pydeobf.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["pydeobf"]
