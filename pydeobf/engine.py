@@ -420,6 +420,10 @@ class Engine:
                                        timeout=self.o.pylingual_timeout)
         lay.decompiled = d.source
         lay.decompile_info = d.info
+        if d.info.get("padded_jumps"):
+            lay.notes.append("bytecode had jump targets past the end of the code (truncated/damaged sample); "
+                             "padded with NOPs so PyLingual could run - decompiled output near the "
+                             "padded spots is approximate: " + "; ".join(d.info["padded_jumps"]))
         if d.source is None:
             lay.notes.append(f"PyLingual failed: {_last_line(d.info.get('error', '?'))[:300]}")
 

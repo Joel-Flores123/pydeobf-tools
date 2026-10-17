@@ -258,6 +258,51 @@ def instructions(code, version):
     return out, index
 
 
+def pad_bad_jumps(blob):
+    """Pad code objects whose jumps point past the end of their bytecode.
+
+    Truncated or carved code (e.g. a module whose ``if __name__ == "__main__"``
+    block lost its epilogue) makes decompilers reject the jump targets.  Each
+    such code object gets NOPs up to the furthest target, then ``LOAD_CONST
+    None; RETURN_VALUE`` when None is a constant.  Only for Python < 3.10
+    (byte-offset jumps, no inline caches).  The blob itself is not modified.
+
+    Returns ``(patched_raw, notes)``, or ``None`` if nothing needed padding.
+    """
+    if blob.raw is None or blob.version >= (3, 10):
+        return None
+    opc = opcode_module(blob.version)
+    nop, load_const, ret = opc.opmap["NOP"], opc.opmap["LOAD_CONST"], opc.opmap["RETURN_VALUE"]
+    raw = blob.raw
+    notes = []
+    for code in iter_code_objects(blob.code):
+        co = bytes(code.co_code)
+        far = max((int(i.argval) for i in get_instructions_bytes(code, opc)
+                   if i.optype in ("jabs", "jrel") and isinstance(i.argval, int)), default=0)
+        if far < len(co):
+            continue
+        pad = bytes([nop, 0]) * ((far - len(co)) // 2)
+        if None in code.co_consts and code.co_consts.index(None) < 256:
+            pad += bytes([load_const, code.co_consts.index(None), ret, 0])
+        else:
+            pad += bytes([nop, 0]) * 2
+        patched = co + pad
+        # marshal bytes: TYPE_STRING ('s', or with FLAG_REF 0xf3) + u32 length + data
+        for tag in (b"s", b"\xf3"):
+            old = tag + struct.pack("<I", len(co)) + co
+            if raw.count(old) == 1:
+                raw = raw.replace(old, tag + struct.pack("<I", len(patched)) + patched)
+                notes.append(f"{code.co_name}: jump target {far} was past the end of its {len(co)} bytes "
+                             f"of bytecode; padded with {len(pad)} bytes")
+                break
+        else:
+            notes.append(f"{code.co_name}: jump target {far} past end ({len(co)} bytes) "
+                         "but its bytecode could not be located uniquely in the marshal data")
+    if raw is blob.raw or raw == blob.raw:
+        return None
+    return raw, notes
+
+
 def _varint(data, pos):
     b = data[pos]
     val = b & 63

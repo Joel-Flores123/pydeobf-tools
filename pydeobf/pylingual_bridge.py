@@ -52,9 +52,21 @@ def decompile(blob: bc.CodeBlob, workdir: Path, stem: str, *, timeout=600) -> De
         return Decompiled(None, {"ok": False, "error": f"PyLingual does not support Python {bc.vstr(blob.version)}"})
     workdir = Path(workdir).resolve()  # the worker runs with cwd=workdir
     workdir.mkdir(parents=True, exist_ok=True)
+    d = _run(py, blob.raw, blob.version, workdir, stem, timeout)
+    if d.source is None and "invalid target" in str(d.info.get("error", "")):
+        padded = bc.pad_bad_jumps(blob)
+        if padded is not None:
+            raw, notes = padded
+            d2 = _run(py, raw, blob.version, workdir, stem, timeout)
+            d2.info["padded_jumps"] = notes
+            return d2
+    return d
+
+
+def _run(py, raw, version, workdir, stem, timeout) -> Decompiled:
     pyc = workdir / f"{stem}.pyc"
     out = workdir / f"{stem}.pylingual.py"
-    pyc.write_bytes(bc.make_pyc(blob.raw, blob.version))
+    pyc.write_bytes(bc.make_pyc(raw, version))
     env = dict(os.environ)
     pkg_root = str(Path(__file__).resolve().parent.parent)
     env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
