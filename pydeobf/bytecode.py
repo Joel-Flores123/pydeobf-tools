@@ -287,18 +287,85 @@ def pad_bad_jumps(blob):
         else:
             pad += bytes([nop, 0]) * 2
         patched = co + pad
-        # marshal bytes: TYPE_STRING ('s', or with FLAG_REF 0xf3) + u32 length + data
-        for tag in (b"s", b"\xf3"):
-            old = tag + struct.pack("<I", len(co)) + co
-            if raw.count(old) == 1:
-                raw = raw.replace(old, tag + struct.pack("<I", len(patched)) + patched)
-                notes.append(f"{code.co_name}: jump target {far} was past the end of its {len(co)} bytes "
-                             f"of bytecode; padded with {len(pad)} bytes")
-                break
+        new_raw = _replace_co_code(raw, co, patched)
+        if new_raw is not None:
+            raw = new_raw
+            notes.append(f"{code.co_name}: jump target {far} was past the end of its {len(co)} bytes "
+                         f"of bytecode; padded with {len(pad)} bytes")
         else:
             notes.append(f"{code.co_name}: jump target {far} past end ({len(co)} bytes) "
                          "but its bytecode could not be located uniquely in the marshal data")
     if raw is blob.raw or raw == blob.raw:
+        return None
+    return raw, notes
+
+
+def _replace_co_code(raw, co, patched, top_level=False):
+    """Swap one code object's bytecode inside marshal data, or None if it is not found exactly once.
+
+    The top-level code object's bytecode is the first string in its marshal data (only the
+    fixed-size int fields come before it), so for it the first match is used even when the
+    same bytecode appears again later, e.g. in an embedded copy of the next layer.
+    """
+    # marshal bytes: TYPE_STRING ('s', or with FLAG_REF 0xf3) + u32 length + data
+    for tag in (b"s", b"\xf3"):
+        old = tag + struct.pack("<I", len(co)) + co
+        new = tag + struct.pack("<I", len(patched)) + patched
+        if raw.count(old) == 1:
+            return raw.replace(old, new)
+        if top_level and 0 <= raw.find(old) < 64:
+            return raw.replace(old, new, 1)
+    return None
+
+
+_PURE_LOADS = {"LOAD_CONST", "LOAD_NAME", "LOAD_GLOBAL", "LOAD_FAST", "LOAD_DEREF", "LOAD_CLOSURE"}
+
+
+def neutralize_bad_makefunc(blob):
+    """Rewrite MAKE_FUNCTIONs that have no code object to build a function from.
+
+    Obfuscators plant these in dead branches (``foo = False; if foo: bar =
+    <MAKE_FUNCTION of two ints>``) to crash decompilers, which look up the
+    function's code object from the preceding LOAD_CONST.  Each one becomes a
+    same-size ``BUILD_TUPLE n`` of the n values actually pushed before it.
+    Python 3.6-3.12 only (3.13+ splits MAKE_FUNCTION into several ops).  The
+    blob itself is not modified.
+
+    Returns ``(patched_raw, notes)``, or ``None`` if nothing needed rewriting.
+    """
+    if blob.raw is None or not (3, 6) <= blob.version < (3, 13):
+        return None
+    opc = opcode_module(blob.version)
+    build_tuple, ext = opc.opmap["BUILD_TUPLE"], opc.opmap["EXTENDED_ARG"]
+    func_slot = 2 if blob.version < (3, 11) else 1  # code object is below the qualname before 3.11
+    raw = blob.raw
+    notes = []
+    for code in iter_code_objects(blob.code):
+        ins, _ = instructions(code, blob.version)
+        co = bytearray(code.co_code)
+        for i, inst in enumerate(ins):
+            if inst.opname != "MAKE_FUNCTION":
+                continue
+            if i >= func_slot and ins[i - func_slot].opname == "LOAD_CONST" and is_code(ins[i - func_slot].argval):
+                continue
+            expected = func_slot + bin((inst.arg or 0) & 0xF).count("1")
+            pushed = 0
+            while pushed < expected and i - pushed > 0 and ins[i - pushed - 1].opname in _PURE_LOADS:
+                pushed += 1
+            off = inst.offset
+            if pushed == 0 or (off >= 2 and co[off - 2] == ext):
+                notes.append(f"{code.co_name}: MAKE_FUNCTION at {off} has no code object but could not be rewritten")
+                continue
+            co[off], co[off + 1] = build_tuple, pushed
+            notes.append(f"{code.co_name}: MAKE_FUNCTION at {off} has no code object (anti-decompiler junk); "
+                         f"rewritten as BUILD_TUPLE {pushed}")
+        if co != code.co_code:
+            new_raw = _replace_co_code(raw, bytes(code.co_code), bytes(co), top_level=code is blob.code)
+            if new_raw is not None:
+                raw = new_raw
+            else:
+                notes.append(f"{code.co_name}: bytecode could not be located uniquely in the marshal data")
+    if not notes:
         return None
     return raw, notes
 

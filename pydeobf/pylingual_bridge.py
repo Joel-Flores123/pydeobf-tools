@@ -52,14 +52,19 @@ def decompile(blob: bc.CodeBlob, workdir: Path, stem: str, *, timeout=600) -> De
         return Decompiled(None, {"ok": False, "error": f"PyLingual does not support Python {bc.vstr(blob.version)}"})
     workdir = Path(workdir).resolve()  # the worker runs with cwd=workdir
     workdir.mkdir(parents=True, exist_ok=True)
+    # junk MAKE_FUNCTIONs crash PyLingual's masking, so fix them before the first run
+    neutralized = bc.neutralize_bad_makefunc(blob)
+    if neutralized is not None:
+        blob = bc.CodeBlob(bc.unmarshal(neutralized[0], blob.version)[0], blob.version, neutralized[0])
     d = _run(py, blob.raw, blob.version, workdir, stem, timeout)
     if d.source is None and "invalid target" in str(d.info.get("error", "")):
         padded = bc.pad_bad_jumps(blob)
         if padded is not None:
             raw, notes = padded
-            d2 = _run(py, raw, blob.version, workdir, stem, timeout)
-            d2.info["padded_jumps"] = notes
-            return d2
+            d = _run(py, raw, blob.version, workdir, stem, timeout)
+            d.info["padded_jumps"] = notes
+    if neutralized is not None:
+        d.info["neutralized_makefunc"] = neutralized[1]
     return d
 
 

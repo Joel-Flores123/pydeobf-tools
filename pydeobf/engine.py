@@ -424,6 +424,9 @@ class Engine:
             lay.notes.append("bytecode had jump targets past the end of the code (truncated/damaged sample); "
                              "padded with NOPs so PyLingual could run - decompiled output near the "
                              "padded spots is approximate: " + "; ".join(d.info["padded_jumps"]))
+        if d.info.get("neutralized_makefunc"):
+            lay.notes.append("bytecode had MAKE_FUNCTIONs without a code object (anti-decompiler junk); "
+                             "rewritten before PyLingual: " + "; ".join(d.info["neutralized_makefunc"]))
         if d.source is None:
             lay.notes.append(f"PyLingual failed: {_last_line(d.info.get('error', '?'))[:300]}")
 

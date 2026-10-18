@@ -52,7 +52,9 @@ _ITER_TYPES = tuple({
     collections.OrderedDict, collections.deque, collections.Counter, collections.defaultdict,
     type(memoryview(b"")),
 })
-SAFE_INSTANCE_TYPES = frozenset(PRIMITIVE_TYPES + _ITER_TYPES)
+# sys.version_info as reported to emulated code that targets another Python version
+VersionInfo = collections.namedtuple("version_info", "major minor micro releaselevel serial")
+SAFE_INSTANCE_TYPES = frozenset(PRIMITIVE_TYPES + _ITER_TYPES + (VersionInfo,))
 
 _EXC_TYPES = [v for v in vars(_b).values() if isinstance(v, type) and issubclass(v, BaseException)]
 
@@ -270,9 +272,21 @@ def functools_reduce(fn, seq, *init):
 _allow(functools_reduce)
 
 
+def _sys_version(version):
+    """version_info, version and hexversion as seen by code compiled for ``version``."""
+    if tuple(version) == sys.version_info[:2]:
+        return sys.version_info, sys.version, sys.hexversion
+    major, minor = version
+    info = VersionInfo(major, minor, 0, "final", 0)
+    return info, f"{major}.{minor}.0 (main, Jan  1 2024, 00:00:00) [GCC 11.4.0]", (major << 24) | (minor << 16) | 0xF0
+
+
 def get_module(vm, name):
-    if name in vm.modules:
-        return vm.modules[name]
+    # obfuscated samples compare sys.version with the version they were compiled for and exit on a mismatch
+    version = vm.frames[-1].version if vm.frames else _vm.HOST
+    key = (name, version) if name == "sys" else name
+    if key in vm.modules:
+        return vm.modules[key]
     if not hasattr(vm, "_static_mods"):
         vm._static_mods = _static_modules(vm.platform)
     mod = None
@@ -282,8 +296,9 @@ def get_module(vm, name):
         mod = _vm.SafeModule("marshal", {"loads": _vm.Special("loads", vm.marshal_loads),
                                          "load": _vm.Special("load", lambda f: vm.marshal_loads(f.read()))})
     elif name == "sys":
+        version_info, version_str, hexversion = _sys_version(version)
         mod = _vm.SafeModule("sys", {
-            "version_info": sys.version_info, "version": sys.version, "hexversion": sys.hexversion,
+            "version_info": version_info, "version": version_str, "hexversion": hexversion,
             "platform": "win32" if vm.platform == "windows" else "linux", "argv": ["main.py"],
             "maxsize": sys.maxsize, "byteorder": "little", "executable": "python",
             "exit": vm.builtins["exit"], "modules": {}, "flags": _vm.Opaque("sys.flags"),
@@ -317,7 +332,7 @@ def get_module(vm, name):
     elif name in vm._static_mods:
         mod = _mod(name, vm._static_mods[name])
     if mod is not None:
-        vm.modules[name] = mod
+        vm.modules[key] = mod
     return mod
 
 
