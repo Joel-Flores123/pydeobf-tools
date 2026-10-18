@@ -508,6 +508,8 @@ class Emulator:
             res.error = "recursion limit"
         except MemoryError:
             res.error = "memory limit"
+        except Exception as e:  # emulator bug or bytecode it mis-decodes; let the fallbacks run
+            res.error = f"emulator crashed: {type(e).__name__}: {describe(str(e))}"
         res.payloads = self.payloads
         res.events = self.events
         res.steps = self.steps

@@ -154,7 +154,10 @@ class Engine:
         if bc.looks_like_pyc(data):
             blob = bc.read_pyc(data)
             self.version_hint = self.version_hint or blob.version
-            self.add_layer(None, "code", blob, "input (.pyc)")
+            origin = "input (.pyc)"
+            if blob.meta.get("header_version"):
+                origin = f"input (.pyc, header says Python {blob.meta['header_version']})"
+            self.add_layer(None, "code", blob, origin)
         else:
             self.add_layer(None, "source", repair.decode_source(data), "input (.py)")
 

@@ -89,7 +89,18 @@ def read_pyc(data: bytes) -> CodeBlob:
     vtuple = magics.magic_int2tuple(magic_int)[:2]
     hdr = pyc_header_size(vtuple)
     raw = data[hdr:]
-    code = load_code(io.BytesIO(raw), magic_int)
+    try:
+        code = load_code(io.BytesIO(raw), magic_int)
+    except Exception:
+        code = None
+    if code is None or not validate_code(code, vtuple):
+        # extracted pycs (e.g. pyinstxtractor) can carry the magic of the wrong Python version
+        blob = detect_marshal(raw, tuple(vtuple))
+        if blob is not None and blob.version != tuple(vtuple):
+            blob.meta.update(magic_int=magic_int, header_version=vstr(vtuple))
+            return blob
+        if code is None:
+            raise ValueError(f"cannot unmarshal .pyc as Python {vstr(vtuple)} (header magic {magic_int})")
     return CodeBlob(code=code, version=tuple(vtuple), raw=raw, meta={"magic_int": magic_int})
 
 
