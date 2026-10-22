@@ -40,13 +40,67 @@ def magic_int_for(version) -> int:
     return magics.magic2int(magic_for(version))
 
 
+def patch_xdis_lenient() -> None:
+    """Make xdis' disassembly tolerate out-of-range operands in junk bytecode.
+
+    Obfuscators (PyArmor's ``obfuscate code`` mode) plant unreachable garbage
+    after an unconditional ``JUMP_FORWARD``.  Those dead bytes decode to
+    instructions whose operands point past the real tables.  xdis' ``get_name_info``
+    already guards its index, but ``get_const_info`` does not and raises a bare
+    ``IndexError`` that aborts the whole disassembly (and, downstream, PyLingual).
+    Guard it the same way: for an out-of-range index fall back to the raw index,
+    exactly as ``get_name_info`` does.  Reachable code never references an
+    out-of-range const, so this only ever affects dead junk.  Idempotent.
+    """
+    import xdis.bytecode as _xb
+
+    if getattr(_xb.get_const_info, "_pydeobf_lenient", False):
+        return
+    _orig = _xb.get_const_info
+
+    def get_const_info(const_index, const_list):
+        if const_list is not None and not (0 <= const_index < len(const_list)):
+            return const_index, repr(const_index)
+        return _orig(const_index, const_list)
+
+    get_const_info._pydeobf_lenient = True
+    _xb.get_const_info = _xb._get_const_info = get_const_info
+
+
+patch_xdis_lenient()
+
+
 _OPC_CACHE: dict = {}
+
+
+def _lenient_fmt(fn):
+    """Wrap an xdis argrepr formatter so junk operands can't abort disassembly.
+
+    xdis' arg formatters are purely cosmetic (they build the ``# ...`` comment),
+    but several of them ``assert`` on operand ranges, e.g. ``format_RAISE_VARARGS``
+    requires ``0 <= argc <= 2``.  Obfuscators plant unreachable junk bytes (after
+    a ``JUMP_FORWARD`` over them) that decode to out-of-range operands, so a plain
+    linear disassembly of the whole ``co_code`` trips the assert and raises a bare
+    ``AssertionError``.  We never use the argrepr, so swallow any failure.
+    """
+    def wrapped(arg):
+        try:
+            return fn(arg)
+        except Exception:
+            return None
+    return wrapped
 
 
 def opcode_module(version):
     key = tuple(version[:2])
     if key not in _OPC_CACHE:
-        _OPC_CACHE[key] = get_opcode_module(key, PythonImplementation.CPython)
+        opc = get_opcode_module(key, PythonImplementation.CPython)
+        fmt = getattr(opc, "opcode_arg_fmt", None)
+        if isinstance(fmt, dict):
+            for name, fn in list(fmt.items()):
+                if callable(fn):
+                    fmt[name] = _lenient_fmt(fn)
+        _OPC_CACHE[key] = opc
     return _OPC_CACHE[key]
 
 
@@ -352,7 +406,13 @@ def neutralize_bad_makefunc(blob):
     raw = blob.raw
     notes = []
     for code in iter_code_objects(blob.code):
-        ins, _ = instructions(code, blob.version)
+        try:
+            ins, _ = instructions(code, blob.version)
+        except Exception:
+            # Unreachable anti-disassembly junk (jumped over at runtime) can decode
+            # to operands xdis' linear sweep rejects (bad cmp_op/name indexes, etc.).
+            # This pass is best-effort; skip a code object we cannot cleanly decode.
+            continue
         co = bytearray(code.co_code)
         for i, inst in enumerate(ins):
             if inst.opname != "MAKE_FUNCTION":

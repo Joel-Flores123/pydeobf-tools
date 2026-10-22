@@ -121,7 +121,8 @@ def find_pyarmor_blob(source: str):
             runtime_pkg = node.module
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "__pyarmor__":
             for a in node.args:
-                if isinstance(a, ast.Constant) and isinstance(a.value, bytes) and a.value[:2] == b"PY":
+                if isinstance(a, ast.Constant) and isinstance(a.value, bytes) and a.value[:2] == b"PY" \
+                        and not a.value.startswith(b"PYARMOR"):  # <= 7 blobs: see pyarmor7.py
                     return a.value, {"runtime_pkg": runtime_pkg}
     return None
 

@@ -8,13 +8,14 @@ decompiles the recovered bytecode back to source.
 
 - Sandboxed bytecode emulator for CPython 3.6–3.15. It follows `exec`/`eval`/`marshal.loads` chains and records each payload as a layer.
 - Static PyArmor 8/9 unpacking. The runtime library is only read as bytes, never loaded.
+- Static PyArmor ≤7 (pytransform) handling: header report, plain-marshal (`--obf-mod 0`) module recovery, wrap-mode stripping.
 - Blob search for base64, base32, hex, zlib, bz2, lzma, marshal, rot13 and shift encodings.
 - Source clean-up: folds encoded strings, inlines aliases, removes dead code, renames confusable identifiers.
 - IOC report: URLs, paths and other strings, plus every file, OS and network call the sample attempted.
 
 Supported: Specter, Berserker, Kramer, Kyrie-Eleison, PyObfuscate, pyminifier,
-Hyperion, PyArmor 8/9. Names renamed by pyminifier or Hyperion can't be
-recovered. PyArmor 7 is only detected.
+Hyperion, PyArmor 8/9, PyArmor ≤7 (partly, see below). Names renamed by
+pyminifier or Hyperion can't be recovered.
 
 ## Install
 
@@ -54,10 +55,18 @@ Output:
 2. **Blob search** (`blobs.py`): decodes long constants the emulator couldn't resolve.
 3. **PyArmor** (`pyarmor.py`): decrypts the outer blob and each code object using
    the runtime's key, or the public trial key, and rebuilds a standard `.pyc`.
-4. **PyLingual** (`pylingual_bridge.py`, optional): the only bytecode-to-source step,
+4. **PyArmor ≤7** (`pyarmor7.py`): the module payload is normally encrypted by
+   the closed-source `_pytransform` with the project's key. That cipher isn't
+   reimplemented, so these samples only get a header report (Python version,
+   restrict mode, runtime tag). If the payload is plain marshal (`--obf-mod 0`),
+   the module is recovered. Code objects whose bytecode is already plain
+   (`--obf-code 0`, or a `.pyc` dumped from memory) lose their
+   `__armor_enter__`/`__armor_exit__` wrapper. If the bytecode is still encrypted,
+   `final.py` is a skeleton of signatures, names and constants.
+5. **PyLingual** (`pylingual_bridge.py`, optional): the only bytecode-to-source step,
    run in a subprocess. Source-level obfuscators and PyArmor unpacking don't need it.
    Without it (or with `--no-pylingual`), bytecode layers are written as `.pyc` plus a disassembly.
-5. **Clean-up** (`cleanup.py`): the source passes listed above.
+6. **Clean-up** (`cleanup.py`): the source passes listed above.
 
 PyArmor decryption is exact, but PyLingual is weak on PyArmor output for Python
 3.8–3.10. In that case `final.py` says so and points to the disassembly in
@@ -72,7 +81,8 @@ instead of calling `exec`, `eval` or `marshal.loads` on sample data.
 
 PyArmor unpacking follows the algorithm of
 [Pyarmor-Static-Unpack-1shot](https://github.com/Lil-House/Pyarmor-Static-Unpack-1shot)
-and cyber.wtf's "Unpacking Pyarmor v8+ scripts". Bytecode is decoded with
+and cyber.wtf's "Unpacking Pyarmor v8+ scripts". PyArmor ≤7 wrapper removal follows
+[PyArmor-Unpacker](https://github.com/Svenskithesource/PyArmor-Unpacker), done statically. Bytecode is decoded with
 [xdis](https://github.com/rocky/python-xdis) and decompiled with
 [PyLingual](https://github.com/syssec-utd/pylingual).
 

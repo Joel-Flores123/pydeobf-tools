@@ -34,6 +34,7 @@ class Options:
     use_pylingual: bool = True
     decompile_all: bool = False
     pylingual_timeout: int = 600
+    pylingual_redis: str | None = None  # HOST[:PORT] of a Redis translation cache
     max_steps: int = 30_000_000
     max_seconds: float = 120.0
     max_layers: int = 400
@@ -67,6 +68,7 @@ class Layer:
     salvaged: str | None = None
     prerun: object = None  # vm.Payload from inline emulation inside the parent
     _bcc: list = field(default_factory=list)  # PyArmor BCC native segments
+    opaque: bool = False  # bytecode still encrypted (PyArmor 7): don't emulate or decompile
     files: dict = field(default_factory=dict)
 
     @property
@@ -238,6 +240,76 @@ class Engine:
         if child is None:
             lay.notes.append("PyArmor payload already seen")
 
+    def _try_pyarmor7(self, lay) -> bool:
+        """PyArmor <= 7: report the blob header, recover a plain (obf-mod 0)
+        module, and strip wrap-mode headers from bytecode that is already plain.
+        Returns True if the layer was PyArmor <= 7. Never loads pytransform."""
+        from . import pyarmor7 as pa7
+        if lay.kind == "code":
+            if any(pa7.find_wrapper(c, lay.blob.version) for c in bc.iter_code_objects(lay.blob.code)):
+                self._pyarmor7_module(lay, lay.blob, in_place=True)
+                return True
+            blob = pa7.find_blob_code(lay.blob.code) if "PyArmor" in lay.detections else None
+            mode = None
+        else:
+            found = pa7.find_blob_source(lay.source) if "PyArmor" in lay.detections else None
+            blob, mode = found or (None, None)
+        if blob is None:
+            return False
+        try:
+            hdr = pa7.parse_header(blob)
+        except ValueError as e:
+            lay.notes.append(f"PyArmor <= 7 header unreadable: {e}")
+            return True
+        self.pyarmor = {**(self.pyarmor or {}), **hdr.info(), "layer": lay.index}
+        if mode is not None:
+            self.pyarmor["call_mode"] = mode
+        module = pa7.plain_module(blob, hdr)
+        status = "plain marshal (obf-mod 0)"
+        if module is None:
+            found = pa7.decrypted_module(blob, hdr)
+            if found is None:
+                self.pyarmor["module"] = "encrypted"
+                lay.notes.append(pa7.NOTE_ENCRYPTED)
+                return True
+            module, fix_name = found
+            status = f"decrypted ({fix_name} capsule key)"
+            self.pyarmor["capsule_key"] = fix_name
+            lay.notes.append(f"PyArmor 7: payload decrypted with the {fix_name} capsule key (AES-128-GCM)")
+        self.pyarmor["module"] = status
+        self.version_hint = hdr.version
+        self._pyarmor7_module(lay, module)
+        return True
+
+    def _pyarmor7_module(self, lay, module, in_place=False):
+        """Unwrap ``module``'s code objects. Plain result -> normal code layer;
+        bodies still encrypted -> opaque code layer plus a source skeleton."""
+        from . import pyarmor7 as pa7
+        raw, stripped, encrypted, notes = pa7.unwrap(module)
+        lay.notes.extend(notes)
+        self.pyarmor = {**(self.pyarmor or {}), "unwrapped_code_objects": stripped,
+                        "encrypted_code_objects": encrypted}
+        if raw is not None:
+            module = bc.CodeBlob(code=bc.unmarshal(raw, module.version)[0], version=module.version, raw=raw,
+                                 meta=module.meta)
+            lay.notes.append(f"PyArmor 7: stripped the __armor_enter__/__armor_exit__ wrapper from {stripped} "
+                             "code object(s)")
+        if in_place and raw is None:
+            target = lay
+        else:
+            origin = "pyarmor7-unwrap" if in_place else "pyarmor7-module"
+            target = self.add_layer(lay.index, "code", module, origin)
+            if target is None:
+                lay.notes.append("PyArmor 7 payload already seen")
+                return
+            lay.wrapper = True
+        if not encrypted:
+            return
+        target.opaque = True
+        target.notes.append(f"PyArmor 7: {encrypted} code object(s) still have runtime-encrypted bytecode; "
+                            "not emulated or decompiled, a skeleton of names and constants is written instead")
+        self.add_layer(target.index, "source", pa7.skeleton(module), "pyarmor7-skeleton")
+
     def _emulate(self, lay, code, version):
         emu = self.emu
         emu.payloads = []
@@ -298,7 +370,16 @@ class Engine:
 
     def process(self, lay: Layer):
         self._detect(lay)
-        if self.o.pyarmor and "PyArmor" in lay.detections:
+        if lay.opaque:
+            self._search_blobs(lay)
+            return
+        if self.o.pyarmor and self._try_pyarmor7(lay):
+            if lay.opaque:
+                self._search_blobs(lay)
+                return
+            if lay.children:
+                return
+        elif self.o.pyarmor and "PyArmor" in lay.detections:
             self._try_pyarmor(lay)
             if lay.children:
                 return
@@ -329,15 +410,20 @@ class Engine:
                     for p in res2.payloads:
                         self._add_payload(lay, p, origin_prefix="pylingual+")
         # Fallback 2: brute-force decode long constants
-        if not lay.children and self.o.blob_search:
-            consts = self._constants(lay)
-            for cand in blobs.search_many(consts, self.version_hint):
-                child = self.add_layer(lay.index, cand.kind, cand.value, "blob:" + "+".join(cand.chain),
-                                       lay.globals)
-                if child is not None:
-                    lay.notes.append(f"decoded embedded blob via {' -> '.join(cand.chain)}")
+        if not lay.children:
+            self._search_blobs(lay)
         if lay.kind == "code" and lay.children:
             lay.wrapper = self._is_wrapper(lay)
+
+    def _search_blobs(self, lay):
+        if not self.o.blob_search:
+            return
+        consts = self._constants(lay)
+        for cand in blobs.search_many(consts, self.version_hint):
+            child = self.add_layer(lay.index, cand.kind, cand.value, "blob:" + "+".join(cand.chain),
+                                   lay.globals)
+            if child is not None:
+                lay.notes.append(f"decoded embedded blob via {' -> '.join(cand.chain)}")
 
     def _constants(self, lay):
         if lay.kind == "code":
@@ -420,7 +506,7 @@ class Engine:
             return
         self.log(f"layer {lay.index}: decompiling Python {bc.vstr(lay.blob.version)} bytecode with PyLingual")
         d = pylingual_bridge.decompile(lay.blob, self.workdir / "layers", f"L{lay.index:02d}",
-                                       timeout=self.o.pylingual_timeout)
+                                       timeout=self.o.pylingual_timeout, redis=self.o.pylingual_redis)
         lay.decompiled = d.source
         lay.decompile_info = d.info
         if d.info.get("padded_jumps"):
@@ -438,7 +524,7 @@ class Engine:
     def finish(self):
         for lay in self.layers:
             leaf = not lay.children
-            if lay.kind == "code" and (leaf or self.o.decompile_all or not lay.wrapper):
+            if lay.kind == "code" and not lay.opaque and (leaf or self.o.decompile_all or not lay.wrapper):
                 size = sum(len(c.co_code) for c in bc.iter_code_objects(lay.blob.code))
                 if not leaf and not self.o.decompile_all and size > 200_000:
                     lay.notes.append(f"not decompiled: {size} bytes of bytecode in a non-final layer "

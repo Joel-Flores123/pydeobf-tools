@@ -7,6 +7,7 @@ bytecode emulator, and recovered bytecode is optionally decompiled with PyLingua
 from __future__ import annotations
 
 import argparse
+import os
 import resource
 import sys
 from pathlib import Path
@@ -39,6 +40,9 @@ def main(argv=None):
     ap.add_argument("--no-pylingual", action="store_true", help="never call PyLingual")
     ap.add_argument("--decompile-all", action="store_true", help="also decompile wrapper layers")
     ap.add_argument("--pylingual-timeout", type=int, default=600)
+    ap.add_argument("--pylingual-redis", metavar="HOST[:PORT]", default=os.environ.get("PYDEOBF_PYLINGUAL_REDIS"),
+                    help="Redis server PyLingual uses to cache statement translations across runs "
+                    "(default port 6379; env PYDEOBF_PYLINGUAL_REDIS)")
     ap.add_argument("--max-steps", type=int, default=30_000_000, help="emulator instruction budget per layer")
     ap.add_argument("--max-seconds", type=float, default=120.0, help="emulator time budget per layer")
     ap.add_argument("--max-layers", type=int, default=400)
@@ -63,7 +67,7 @@ def main(argv=None):
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
 
     opts = Options(version_hint=a.py_version, use_pylingual=not a.no_pylingual, decompile_all=a.decompile_all,
-                   pylingual_timeout=a.pylingual_timeout, max_steps=a.max_steps,
+                   pylingual_timeout=a.pylingual_timeout, pylingual_redis=a.pylingual_redis, max_steps=a.max_steps,
                    max_seconds=a.max_seconds, max_layers=a.max_layers, platform=a.platform, fold=not a.no_fold,
                    rename=not a.no_rename, blob_search=not a.no_blob_search, quiet=a.quiet,
                    pyarmor_runtime=a.pyarmor_runtime, pyarmor=not a.no_pyarmor)

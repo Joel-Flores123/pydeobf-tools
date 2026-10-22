@@ -48,6 +48,14 @@ def _patch_xdis_312_probe():
     xdis.load.load_module_from_file_object = patched
 
 
+def _redis_reachable(host, port):
+    import redis
+    try:
+        return redis.StrictRedis(host=host, port=port, socket_connect_timeout=2).ping()
+    except redis.RedisError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pyc")
@@ -55,17 +63,30 @@ def main():
     ap.add_argument("--timeout", type=int, default=None)
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--trust-lnotab", action="store_true")
+    ap.add_argument("--redis", help="HOST[:PORT] of a Redis translation cache")
     a = ap.parse_args()
 
     logging.basicConfig(level="WARNING")
     _patch_xdis_312_probe()
+    # Tolerate out-of-range operands in unreachable anti-disassembly junk so
+    # PyLingual's xdis-based loader doesn't abort on dead bytecode.
+    from pydeobf.bytecode import patch_xdis_lenient
+    patch_xdis_lenient()
     from pylingual.decompiler import decompile
 
     out = Path(a.out)
+    redis_host, redis_port = None, 6379
+    if a.redis:
+        redis_host, _, port = a.redis.partition(":")
+        redis_port = int(port or 6379)
+        if not _redis_reachable(redis_host, redis_port):
+            logging.warning("Redis %s:%s unreachable; decompiling without the translation cache", redis_host, redis_port)
+            redis_host = None
     summary = {"ok": False}
     try:
         res = decompile(pyc=Path(a.pyc), save_to=out, config_file=None, version=None, top_k=a.top_k,
-                        trust_lnotab=a.trust_lnotab, timeout=a.timeout)
+                        trust_lnotab=a.trust_lnotab, timeout=a.timeout,
+                        redis_cache_server_ip=redis_host, redis_port=redis_port)
         results = [r for r in res.equivalence_results if hasattr(r, "success")]
 
         def describe(r):
