@@ -75,6 +75,66 @@ def _nonlatin_identifiers(text: str) -> bool:
     return False
 
 
+GENERIC = ("marshal-exec", "base64/zlib-exec")
+# An embedded payload is at least this many encoded bytes / small ints in total.
+PAYLOAD_MIN = 256
+_MIN_PIECE = 64
+
+
+def _encoded_len(v) -> int:
+    """len(v) if the constant looks like encoded data (base64/b85/hex text, raw binary), else 0."""
+    if len(v) < _MIN_PIECE:
+        return 0
+    head = v[:4096]
+    codes = list(head) if isinstance(head, bytes) else [ord(c) for c in head]
+    if len({b - a for a, b in zip(codes, codes[1:])}) == 1:  # range table (str.maketrans etc.)
+        return 0
+    if isinstance(head, bytes):
+        ctrl = sum(1 for c in codes if c < 9 or 13 < c < 32 or c > 126)
+    else:  # non-ASCII letters are text; binary decoded as latin-1 shows C0/C1 controls
+        ctrl = sum(1 for c in codes if c < 9 or 13 < c < 32 or 0x7F <= c < 0xA0)
+    if ctrl / len(codes) > 0.15:
+        return len(v)  # raw binary: marshal/zlib/encrypted bytes
+    if any(c > 126 for c in codes):
+        return 0
+    # text encodings (base64/32/85, hex) have no whitespace and a varied alphabet;
+    # prose, paths and identifiers fail one of the two
+    ws = sum(1 for c in codes if c in (9, 10, 13, 32))
+    if ws > len(codes) // 100 or len(set(codes)) < 16:
+        return 0
+    return len(v)
+
+
+def embedded_payload_size(code) -> int:
+    """Encoded bytes (or small ints) embedded as constants anywhere in ``code``.
+
+    marshal.loads / exec(zlib...) alone is ordinary code (PyInstaller's loader,
+    importlib, tools that *write* obfuscated files, loaders that read their payload
+    from disk or the network). An encoding-based obfuscated sample carries its
+    payload inside, so generic detections need this to be >= PAYLOAD_MIN.
+    """
+    from .bytecode import iter_code_objects
+
+    total = 0
+    stack = []
+    for c in iter_code_objects(code):
+        stack.extend(c.co_consts)
+        while stack:
+            k = stack.pop()
+            if isinstance(k, (str, bytes)):
+                total += _encoded_len(k)
+            elif isinstance(k, int) and k.bit_length() >= 8 * _MIN_PIECE:  # int.to_bytes payloads
+                total += k.bit_length() // 8
+            elif isinstance(k, (tuple, frozenset)):
+                ints = sum(1 for e in k if isinstance(e, int) and not isinstance(e, bool))
+                if ints >= 512:  # bytes([..]) payloads; smaller ones are lookup tables (S-boxes, CRC)
+                    total += ints
+                stack.extend(e for e in k if not isinstance(e, int))
+            if total >= PAYLOAD_MIN:
+                return total
+    return total
+
+
 def detect_code_strings(strings, names=()) -> list[str]:
     text = "\n".join(s if isinstance(s, str) else s.decode("latin-1") for s in strings[:5000])
     text += "\n" + " ".join(names)

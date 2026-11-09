@@ -603,7 +603,7 @@ class _PyArmorArtifacts(ast.NodeTransformer):
         c = node.value
         if isinstance(c, ast.Call):
             f = c.func
-            name = f.id if isinstance(f, ast.Name) else (f.value.value if isinstance(f, ast.Constant) else None)
+            name = f.id if isinstance(f, ast.Name) else (f.value if isinstance(f, ast.Constant) else None)
             if isinstance(name, str) and name.startswith("__pyarmor_"):
                 self.count += 1
                 return None

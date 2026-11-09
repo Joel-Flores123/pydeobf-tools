@@ -11,8 +11,11 @@ represented by opaque placeholder values and logged as an event.
 
 from __future__ import annotations
 
+import builtins
 import functools
+import marshal
 import operator
+import sys
 import time
 import types
 from dataclasses import dataclass, field
@@ -294,21 +297,27 @@ class SafeModule(VMObject):
             return self.attrs
         return Opaque(f"{self.__name__}.{name}")
 
-    def __repr__(self):
-        return f"<module {self.__name__}>"
+    def __repr__(self):  # as CPython prints it: anti-tamper checks compare str(module)
+        if self.__name__ in sys.builtin_module_names:
+            return f"<module '{self.__name__}' (built-in)>"
+        return f"<module '{self.__name__}'>"
 
 
 class Special(VMObject):
     """An emulator-implemented builtin (exec, eval, globals, open, ...)."""
 
-    def __init__(self, name, fn):
+    def __init__(self, name, fn, module="builtins", host=False):
         self.__name__ = name
         self.fn = fn
+        self.module = module
+        self.host = host  # fn is an allow-listed host function: call it with the host-call guards
 
     def __call__(self, *args, **kwargs):
         return self.fn(*args, **kwargs)
 
     def __repr__(self):
+        if self.module == "builtins" and isinstance(getattr(builtins, self.__name__, None), type):
+            return f"<class '{self.__name__}'>"  # emulated type/super/...
         return f"<built-in function {self.__name__}>"
 
 
@@ -340,7 +349,7 @@ class HelperObject(VMObject):
 
 
 class FakeFile(HelperObject):
-    ALLOWED = frozenset({"read", "readlines", "readline", "close", "seek", "tell", "name"})
+    ALLOWED = frozenset({"read", "readlines", "readline", "close", "seek", "tell", "name", "__enter__", "__exit__"})
 
     def __init__(self, data, name):
         self.data = data
@@ -376,6 +385,12 @@ class FakeFile(HelperObject):
     def close(self):
         pass
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
 
 # ------------------------------------------------------------------ result
 
@@ -392,6 +407,7 @@ class Payload:
     raised: str | None = None  # the payload raised a Python exception
     stop: str | None = None
     emulated: bool = False  # inline emulation ran to completion
+    pending: bool = False  # recorded at marshal.loads, not (yet) exec'd
 
 
 @dataclass
@@ -458,12 +474,13 @@ HOST = bc.HOST_VERSION
 
 
 class Emulator:
-    def __init__(self, *, version_hint=None, max_steps=30_000_000, max_seconds=120.0, self_file=None,
+    def __init__(self, *, version_hint=None, max_steps=300_000_000, max_seconds=120.0, self_file=None,
                  self_file_data=None, platform="windows", max_depth=300):
         self.version_hint = version_hint
         self.max_steps = max_steps
         self.max_seconds = max_seconds
         self.self_file = self_file
+        self.script_name = "main.py"  # engine sets the sample's own name when the .pyc records one
         self.self_file_data = self_file_data
         self.platform = platform
         self.max_depth = max_depth
@@ -473,7 +490,8 @@ class Emulator:
         self.frames: list[Frame] = []
         self.payloads: list[Payload] = []
         self.ctx: list[Payload] = []
-        self._payload_keys = set()
+        self._payload_keys = {}  # content key -> Payload
+        self._dumped = {}  # marshal.dumps output -> the VMCompiled/CodeRef it came from
         self.events: list[str] = []
         self.assumptions = 0
         self.code_versions = {}
@@ -485,7 +503,7 @@ class Emulator:
 
     def new_globals(self, name="__main__"):
         return {
-            "__name__": name, "__file__": self.self_file or "<pydeobf>", "__doc__": None, "__package__": None,
+            "__name__": name, "__file__": safelib.script_path(self), "__doc__": None, "__package__": None,
             "__spec__": None, "__loader__": None, "__builtins__": self.builtins_module, "__cached__": None,
         }
 
@@ -522,12 +540,18 @@ class Emulator:
         if len(target) < 2000:
             target.append(msg)
 
-    def add_payload(self, kind, value, via, globals_) -> Payload:
+    def add_payload(self, kind, value, via, globals_, pending=False) -> Payload:
         """Record a payload in the current payload tree (once per content)."""
-        p = Payload(kind, value, via, globals_)
         key = (kind, value if kind == "source" else value.raw or id(value.code))
+        p = self._payload_keys.get(key)
+        if p is not None and p.pending:  # registered at marshal.loads, now exec'd: run that same node
+            p.pending = False
+            p.globals = globals_
+            p.via = via
+            return p
+        p = Payload(kind, value, via, globals_, pending=pending)
         if key not in self._payload_keys:
-            self._payload_keys.add(key)
+            self._payload_keys[key] = p
             (self.ctx[-1].children if self.ctx else self.payloads).append(p)
         return p
 
@@ -536,7 +560,7 @@ class Emulator:
         effects on ``g`` are visible to the code that exec'd it."""
         if p.kind == "source":
             try:
-                code = compile(p.value, "<exec>", "exec", dont_inherit=True)  # compile only
+                code = compile(p.value, "<string>", "exec", dont_inherit=True)  # compile only; CPython names exec(str) "<string>"
             except (SyntaxError, ValueError) as e:
                 p.raised = f"{type(e).__name__}: {e}"
                 p.error = "payload does not compile"
@@ -694,14 +718,17 @@ class Emulator:
         if isinstance(fn, BoundMethod):
             return self.call(fn.func, (fn.obj,) + tuple(args), kwargs)
         if isinstance(fn, Special):
-            return fn.fn(*args, **kwargs)
-        if isinstance(fn, VMClass):
+            if not fn.host:
+                return fn.fn(*args, **kwargs)
+            fn = fn.fn
+        elif isinstance(fn, VMClass):
             return self.instantiate(fn, args, kwargs)
         if isinstance(fn, StaticMethod):
             return self.call(fn.f, args, kwargs)
         if isinstance(fn, Opaque):
             self.event(f"call {fn.reason}({', '.join([describe(a, 80) for a in args] + [f'{k}={describe(v, 80)}' for k, v in kwargs.items()])})")
-            return Opaque(f"{fn.reason}()")
+            known, value = safelib.env_probe(self, fn.reason)
+            return value if known else Opaque(f"{fn.reason}()")
         if isinstance(fn, Unknown):
             return Unknown("result of unknown call")
         if isinstance(fn, VMInstance):
@@ -709,11 +736,15 @@ class Emulator:
             if f is EMPTY:
                 raise VMRaise(TypeError(f"'{fn.cls.__name__}' object is not callable"))
             return self.call(f, (fn,) + tuple(args), kwargs)
+        if fn is type:  # type(x) handed out by the emulated type()
+            fn = self.builtins["type"]
+            return fn.fn(*args, **kwargs)
         if isinstance(fn, functools.partial):
             return self.call(fn.func, fn.args + tuple(args), {**fn.keywords, **kwargs})
-        if isinstance(fn, types.MethodType) and isinstance(fn.__self__, HelperObject):
-            return fn(*args, **kwargs)
-        if not safelib.is_safe_callable(fn):
+        if isinstance(fn, HelperObject) and hasattr(fn, "__call__"):
+            fn = fn.__call__
+        helper = isinstance(fn, types.MethodType) and isinstance(fn.__self__, HelperObject)
+        if not helper and not safelib.is_safe_callable(fn):
             raise VMUnsupported(f"refusing to call non-allow-listed {describe(fn)} {getattr(fn, '__qualname__', '')}")
         for a in args:
             if isinstance(a, Unknown):
@@ -849,6 +880,11 @@ class Emulator:
 
     def getattr(self, obj, name):
         if isinstance(obj, Opaque):
+            # a module attribute we don't model (e.g. inspect.stack): its identity is still known
+            path = obj.reason.split(".")
+            if name in ("__module__", "__name__", "__qualname__") and len(path) > 1 and \
+                    all(p.isidentifier() for p in path):
+                return ".".join(path[:-1]) if name == "__module__" else path[-1]
             return Opaque(f"{obj.reason}.{name}")
         if isinstance(obj, Unknown):
             return Unknown("attribute of unknown")
@@ -919,7 +955,10 @@ class Emulator:
         if isinstance(obj, Special):
             if name in ("__name__", "__qualname__"):
                 return obj.__name__
-            raise VMUnsupported(f"attribute {name} of builtin")
+            if name == "__module__":
+                return obj.module
+            # anti-tamper probes (__wrapped__, __code__, ...) on what should be a real builtin
+            raise VMRaise(AttributeError(f"'builtin_function_or_method' object has no attribute '{name}'"))
         if isinstance(obj, BaseException):
             if name in ("args", "__class__", "msg", "errno", "strerror", "filename", "value", "code"):
                 return getattr(obj, name)
@@ -929,6 +968,13 @@ class Emulator:
                 return getattr(obj, name)
             except AttributeError as e:
                 raise VMRaise(e)
+        if isinstance(obj, type) and name in ("__module__", "__name__", "__qualname__"):
+            return getattr(obj, name)  # plain strings; anti-tamper checks probe these
+        if isinstance(obj, type) and name == "__dict__":
+            # read-only view; calling the descriptors in it is still allow-list gated
+            return types.MappingProxyType(dict(obj.__dict__))
+        if name == "__new__" and isinstance(obj, (type, types.MappingProxyType)):
+            return getattr(obj, name)  # probed via str()/repr(); calls stay allow-list gated
         raise VMUnsupported(f"attribute {name!r} of {type(obj).__name__}")
 
     def setattr(self, obj, name, value):
@@ -945,6 +991,11 @@ class Emulator:
         elif isinstance(obj, Unknown):
             if isinstance(obj, Opaque):
                 self.event(f"setattr {obj.reason}.{name} = {describe(value)}")
+        elif isinstance(obj, SafeModule):  # the emulated module namespace, private to this run
+            self.event(f"setattr {obj.__name__}.{name} = {describe(value)}")
+            obj.attrs[name] = value
+        elif isinstance(obj, Special):  # e.g. marshal.loads.__module__ = 'marshal' when faking a module
+            self.event(f"setattr {obj.__name__}.{name} = {describe(value)} (ignored)")
         else:
             raise VMUnsupported(f"setattr on {type(obj).__name__}")
 
@@ -1097,6 +1148,10 @@ class Emulator:
         if self.assumptions > 2000:
             raise VMStop("too many unknown branches")
         self.event(f"assumed branch at {f.code.co_name}:{ins.offset}")
+        # `if <unknown>: exit()` is an anti-debug / integrity check guarding the payload:
+        # skip the body instead of entering it
+        if default_jump is None and isinstance(ins.argval, int) and _exits_before(f, ins):
+            return ins.argval
         return default_jump
 
     # ------------------------------------------------ interceptors
@@ -1139,7 +1194,7 @@ class Emulator:
         if isinstance(obj, (str, bytes, bytearray)):
             src = self._decode_src(obj)
             try:
-                code = compile(src.strip(), "<eval>", "eval")  # parse only; run by the emulator
+                code = compile(src.strip(), "<string>", "eval")  # parse only; run by the emulator
             except SyntaxError as e:
                 raise VMRaise(e)
             except ValueError as e:
@@ -1182,12 +1237,27 @@ class Emulator:
             raise VMRaise(e)
         return VMCompiled(code, src, mode, filename)
 
+    def marshal_dumps(self, obj, *a):
+        """marshal.dumps of code the emulator holds (kept so a later loads gets it back) or of plain data."""
+        if isinstance(obj, VMCompiled):
+            data = marshal.dumps(obj.code)  # serialises code we compiled from the sample's source; nothing runs
+        elif isinstance(obj, CodeRef) and obj.blob.raw is not None:
+            data = obj.blob.raw
+        elif _plain_data(obj):
+            return marshal.dumps(obj)
+        else:
+            return Opaque("marshal.dumps()")
+        self._dumped[data] = obj
+        return data
+
     def marshal_loads(self, data, *a, **k):
         if isinstance(data, Unknown):
             return Unknown("marshal of unknown")
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise VMRaise(TypeError("marshal.loads() argument must be bytes-like"))
         data = bytes(data)
+        if data in self._dumped:
+            return self._dumped[data]
         hint = self.version_hint
         if self.frames and self.frames[-1].version != HOST:
             hint = self.frames[-1].version
@@ -1210,6 +1280,9 @@ class Emulator:
         if blob.meta.get("uncertain"):
             extra = ", version detection uncertain"
         self.event(f"marshal.loads -> code object (Python {bc.vstr(blob.version)}{extra}, {len(data)} bytes)")
+        if getattr(blob.code, "co_name", "") == "<module>":
+            # a recovered layer even if emulation never reaches its exec (budget, anti-forensics loops, ...)
+            self.add_payload("code", blob, "marshal.loads", None, pending=True)
         return CodeRef(blob)
 
     def make_function_type(self, code, globals_=None, name=None, argdefs=None, closure=None):
@@ -1258,7 +1331,8 @@ class Emulator:
 
     def do_open(self, file, mode="r", *a, **k):
         try:
-            same = isinstance(file, str) and self.self_file is not None and file == self.self_file
+            same = (isinstance(file, str) and self.self_file is not None
+                    and file in (self.self_file, safelib.script_path(self), self.script_name))
         except VMSignal:
             same = False
         if same and not any(c in str(mode) for c in "wax+"):
@@ -1375,10 +1449,49 @@ def _load_ae(vm, f, ins):
 # ---- names
 
 
-def _builtin(vm, name):
+def _plain_data(v, depth=0):
+    if depth > 50:
+        return False
+    if v is None or isinstance(v, (bool, int, float, complex, str, bytes)):
+        return True
+    if isinstance(v, (tuple, list, set, frozenset)):
+        return all(_plain_data(x, depth + 1) for x in v)
+    if isinstance(v, dict):
+        return all(_plain_data(k, depth + 1) and _plain_data(x, depth + 1) for k, x in v.items())
+    return False
+
+
+def _builtin(vm, name, f=None, ins=None):
     if name in vm.builtins:
         return vm.builtins[name]
+    # An inner stage lifted out of its host program uses names the host defined. Recover only when the
+    # NameError would be fatal anyway: a module the host imported, or an outermost-frame lookup no handler catches.
+    if f is not None and not _guarded_any():
+        if name in safelib.AUTO_IMPORT:
+            vm.event(f"name '{name}' undefined: assuming the host program imported it")
+            mod = safelib.get_module(vm, name)
+            return mod if mod is not None else Opaque(name)
+        vm.event(f"name '{name}' undefined: assuming the host program defined it")
+        return Opaque(f"host.{name}")
     raise VMRaise(NameError(f"name '{name}' is not defined"))
+
+
+def _guarded_any():
+    """Would a NameError raised now be caught by any emulated frame on the stack?"""
+    fr = sys._getframe(1)
+    while fr:
+        if fr.f_code.co_name == "_exec" and "ins" in fr.f_locals and "f" in fr.f_locals:
+            if _guarded(fr.f_locals["f"], fr.f_locals["ins"]):
+                return True
+        fr = fr.f_back
+    return False
+
+
+def _guarded(f, ins):
+    """Would an exception raised at ``ins`` be caught inside frame ``f``?"""
+    if f.version >= (3, 11):
+        return any(start <= ins.offset < end for start, end, *_ in f.etable)
+    return any(b.kind != "loop" for b in f.blocks)
 
 
 @handler("LOAD_NAME")
@@ -1389,7 +1502,7 @@ def _load_name(vm, f, ins):
     elif name in f.globals:
         f.stack.append(f.globals[name])
     else:
-        f.stack.append(_builtin(vm, name))
+        f.stack.append(_builtin(vm, name, f, ins))
 
 
 @handler("STORE_NAME")
@@ -1409,7 +1522,7 @@ def _del_name(vm, f, ins):
 @handler("LOAD_GLOBAL")
 def _load_global(vm, f, ins):
     name = ins.argval
-    v = f.globals[name] if name in f.globals else _builtin(vm, name)
+    v = f.globals[name] if name in f.globals else _builtin(vm, name, f, ins)
     push_null = f.version >= (3, 11) and ins.arg & 1
     if push_null and f.version < (3, 13):
         f.stack.append(NULL)
@@ -2031,6 +2144,22 @@ def _jump(vm, f, ins):
     return ins.argval
 
 
+_EXIT_NAMES = frozenset({"exit", "_exit", "quit", "abort", "SystemExit"})
+_LOADS = frozenset({"LOAD_NAME", "LOAD_GLOBAL", "LOAD_ATTR", "LOAD_METHOD", "LOAD_FAST", "LOAD_DEREF"})
+
+
+def _exits_before(f, ins, window=40):
+    """Does the fall-through path from ``ins`` up to its (forward) jump target call exit()?"""
+    target = f.index.get(ins.argval)
+    start = f.index.get(ins.offset)
+    if target is None or start is None or target <= start:
+        return False
+    for nxt in f.ins[start + 1:min(target, start + 1 + window)]:
+        if nxt.opname in _LOADS and nxt.argval in _EXIT_NAMES:
+            return True
+    return False
+
+
 def _cond_jump(jump_if):
     def h(vm, f, ins):
         v = f.stack.pop()
@@ -2070,8 +2199,10 @@ def _jump_or_pop(jump_if):
         try:
             t = vm.truth(v)
         except VMUnknownError:
-            f.stack.pop()
-            return vm.unknown_branch(f, ins, None)
+            r = vm.unknown_branch(f, ins, None)
+            if r is None:  # a taken *_OR_POP jump keeps the value
+                f.stack.pop()
+            return r
         if t == jump_if:
             return ins.argval
         f.stack.pop()
@@ -2177,6 +2308,40 @@ def _end_finally(vm, f, ins):
 @handler("BEGIN_FINALLY")
 def _begin_finally(vm, f, ins):
     f.stack.append(NULL)
+
+
+def _enter_ctx(vm, f):
+    ctx = f.stack.pop()
+    exit_ = vm.getattr(ctx, "__exit__")
+    f.stack.append(exit_)
+    return vm.call(vm.getattr(ctx, "__enter__"), (), {})
+
+
+@handler("SETUP_WITH")
+def _setup_with(vm, f, ins):
+    # 3.9/3.10: the normal exit calls __exit__(None, None, None) with ordinary opcodes
+    if f.version < (3, 9):
+        raise VMUnsupported(f"opcode SETUP_WITH ({bc.vstr(f.version)})")
+    res = _enter_ctx(vm, f)
+    f.blocks.append(Block("except", ins.argval, len(f.stack)))
+    f.stack.append(res)
+
+
+@handler("BEFORE_WITH")
+def _before_with(vm, f, ins):
+    f.stack.append(_enter_ctx(vm, f))
+
+
+@handler("WITH_EXCEPT_START")
+def _with_except_start(vm, f, ins):
+    if f.version >= (3, 14):
+        raise VMUnsupported(f"opcode WITH_EXCEPT_START ({bc.vstr(f.version)})")
+    # <3.11: exit, <prev tb, val, type>, tb, val, type; 3.11+: exit, lasti, prev_exc, val
+    if f.version >= (3, 11):
+        exit_, val = f.stack[-4], f.stack[-1]
+    else:
+        exit_, val = f.stack[-7], f.stack[-2]
+    f.stack.append(vm.call(exit_, (type(val), val, None), {}))
 
 
 @handler("RAISE_VARARGS")

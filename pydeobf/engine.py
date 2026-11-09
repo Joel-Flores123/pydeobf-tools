@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import ntpath
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,7 +36,7 @@ class Options:
     decompile_all: bool = False
     pylingual_timeout: int = 600
     pylingual_redis: str | None = None  # HOST[:PORT] of a Redis translation cache
-    max_steps: int = 30_000_000
+    max_steps: int = 300_000_000  # pure-Python RC4/XOR over MBs of payload; max_seconds is the real cap
     max_seconds: float = 120.0
     max_layers: int = 400
     platform: str = "windows"
@@ -156,6 +157,9 @@ class Engine:
         if bc.looks_like_pyc(data):
             blob = bc.read_pyc(data)
             self.version_hint = self.version_hint or blob.version
+            name = ntpath.basename(str(getattr(blob.code, "co_filename", "")))
+            if name.endswith(".py") and name.isprintable():
+                self.emu.script_name = name
             origin = "input (.pyc)"
             if blob.meta.get("header_version"):
                 origin = f"input (.pyc, header says Python {blob.meta['header_version']})"

@@ -43,7 +43,7 @@ def main(argv=None):
     ap.add_argument("--pylingual-redis", metavar="HOST[:PORT]", default=os.environ.get("PYDEOBF_PYLINGUAL_REDIS"),
                     help="Redis server PyLingual uses to cache statement translations across runs "
                     "(default port 6379; env PYDEOBF_PYLINGUAL_REDIS)")
-    ap.add_argument("--max-steps", type=int, default=30_000_000, help="emulator instruction budget per layer")
+    ap.add_argument("--max-steps", type=int, default=300_000_000, help="emulator instruction budget per layer")
     ap.add_argument("--max-seconds", type=float, default=120.0, help="emulator time budget per layer")
     ap.add_argument("--max-layers", type=int, default=400)
     ap.add_argument("--platform", choices=["windows", "linux"], default="windows",

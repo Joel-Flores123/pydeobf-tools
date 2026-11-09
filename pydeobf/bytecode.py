@@ -70,6 +70,58 @@ def patch_xdis_lenient() -> None:
 patch_xdis_lenient()
 
 
+def patch_xdis_refs() -> None:
+    """Fix two xdis unmarshal bugs that shift its back-reference table.
+
+    * ``t_long`` returns early for a zero-length long without recording the
+      reference CPython records (r_PyLong always ends in R_REF), so every later
+      TYPE_REF resolves to the wrong object: constants come out swapped
+      (``import marshal`` gets a string as its level, keys and blobs change).
+    * ``t_object_reference`` treats ref #0 as invalid and returns the last
+      object; CPython accepts 0 <= n < len(refs).
+    * ``t_string`` decodes TYPE_STRING to str (utf-8, errors ignored) unless the
+      caller passes bytes_for_s, which nothing does for values outside a code
+      object: ``marshal.loads(marshal.dumps(b"..."))`` came back as a lossy str.
+      In Python 3 marshal TYPE_STRING is always bytes.
+    Also: big ints come back as xdis' LongTypeForPython3, whose str() carries a
+    Python 2 ``L`` suffix and which the emulator's allow-list doesn't know; we only
+    read Python 3, so make them plain ints. Idempotent.
+    """
+    import xdis.unmarshal as _xu
+    from xdis.unmarshal import VersionIndependentUnmarshaller as U
+
+    if getattr(U.t_long, "_pydeobf_fixed", False):
+        return
+    _xu.long = int
+    _orig_long = U.t_long
+
+    def t_long(self, save_ref, bytes_for_s=False):
+        pos = self.fp.tell()
+        if self.fp.read(4) == b"\0\0\0\0":
+            return self.r_ref(0, save_ref)
+        self.fp.seek(pos)
+        return _orig_long(self, save_ref, bytes_for_s)
+
+    def t_object_reference(self, save_ref=None, bytes_for_s=False):
+        refnum = self.read_uint32()
+        if not (0 <= refnum < len(self.intern_objects)):
+            return self.intern_objects[-1]
+        return self.intern_objects[refnum]
+
+    _orig_string = U.t_string
+
+    def t_string(self, save_ref, bytes_for_s=False):
+        return _orig_string(self, save_ref, bytes_for_s or tuple(self.version_triple[:1]) >= (3,))
+
+    t_long._pydeobf_fixed = True
+    U.t_string = t_string
+    U.t_long = t_long
+    U.t_object_reference = t_object_reference
+
+
+patch_xdis_refs()
+
+
 _OPC_CACHE: dict = {}
 
 
@@ -306,6 +358,24 @@ class Ins:
 _INS_CACHE: dict = {}
 
 
+_LINE_CACHE: dict = {}
+
+
+def line_at(code, version, offset):
+    """Source line of the instruction at ``offset`` (inspect.stack() / f_lineno as CPython reports it)."""
+    hit = _LINE_CACHE.get(id(code))
+    if hit is None or hit[0] is not code:
+        starts = [(i.offset, i.starts_line) for i in get_instructions_bytes(code, opcode_module(version))
+                  if isinstance(i.starts_line, int)]
+        hit = _LINE_CACHE[id(code)] = (code, starts)
+    line = getattr(code, "co_firstlineno", 0)
+    for off, ln in hit[1]:
+        if off > offset:
+            break
+        line = ln
+    return line
+
+
 def instructions(code, version):
     """Decoded instruction list for ``code`` plus an offset->index map."""
     key = id(code)
@@ -314,11 +384,18 @@ def instructions(code, version):
         return hit[1], hit[2]
     opc = opcode_module(version)
     out = []
+    index = {}
+    pending = []  # offsets of skipped prefixes, which run as part of the next instruction
     for i in get_instructions_bytes(code, opc):
         if i.opname in ("CACHE", "EXTENDED_ARG"):
+            pending.append(i.offset)
             continue
+        # junk-jump obfuscation targets the EXTENDED_ARG in front of an instruction
+        for off in pending:
+            index.setdefault(off, len(out))
+        pending.clear()
+        index[i.offset] = len(out)
         out.append(Ins(i.offset, i.opname, i.arg, i.argval))
-    index = {ins.offset: n for n, ins in enumerate(out)}
     _INS_CACHE[key] = (code, out, index)
     return out, index
 
