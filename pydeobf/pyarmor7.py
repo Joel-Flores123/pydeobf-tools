@@ -44,7 +44,8 @@ ARMOR_NAMES = ("__armor_enter__", "__armor_exit__", "__armor__", "__armor_wrap__
 
 NOTE_ENCRYPTED = (
     "PyArmor <= 7: payload is AES-128-GCM encrypted and no known capsule key decrypts it "
-    "(likely a registered build with a per-user key). Only the header is reported."
+    "(likely a registered build with a per-user key; pass it with --pyarmor7-key). "
+    "Only the header is reported."
 )
 
 # ------------------------------------------------------------- decryption
@@ -56,6 +57,29 @@ NOTE_ENCRYPTED = (
 TRIAL_FIX = bytes.fromhex("6e9ca78879bf7d8e050d4afdd67f3ee7")
 
 KNOWN_FIX: dict[str, bytes] = {"trial": TRIAL_FIX}
+
+
+@dataclass
+class UserKey:
+    """A capsule key supplied on the command line, tried after the trial one.
+    ``inner`` / ``oc2`` are the matching obf_code=1 / obf_code=2 constants
+    when known; otherwise the trial ones are tried for function bodies."""
+    fix: bytes
+    inner: bytes | None = None
+    oc2: bytes | None = None
+
+
+def parse_user_key(spec: str) -> UserKey:
+    """``FIX[:INNER[:OC2]]`` as hex (16, 24 and 16 bytes); spaces ignored."""
+    parts = [bytes.fromhex(p.replace(" ", "").removeprefix("0x")) if p.strip() else None
+             for p in spec.split(":")]
+    if not 1 <= len(parts) <= 3 or parts[0] is None:
+        raise ValueError("expected FIX[:INNER[:OC2]] in hex")
+    parts += [None] * (3 - len(parts))
+    for name, val, size in zip(("FIX", "INNER", "OC2"), parts, (16, 24, 16)):
+        if val is not None and len(val) != size:
+            raise ValueError(f"{name} must be {size} bytes, got {len(val)}")
+    return UserKey(*parts)
 
 # ------------------------------------------------- obf_code=1 body cipher
 #
@@ -319,7 +343,18 @@ def body_is_plain(code, version, start, end, co=None, check_jumps=True) -> bool:
     return True
 
 
-def inner_decrypt(code, version):
+def _decrypt_wrapped(code, version, start, end, co, consts):
+    """co with the body co[start:end] decrypted by the first of ``consts`` that
+    yields plain bytecode, or None."""
+    for const in consts:
+        dec = decrypt_body(co[start:end], co[-16:], const)
+        cand = co[:start] + dec + co[end:]
+        if body_is_plain(code, version, start, end, cand, check_jumps=False):
+            return cand
+    return None
+
+
+def inner_decrypt(code, version, consts=(INNER_CONST,)):
     """co_code with the wrap-mode body decrypted in place (wrapper kept), or None."""
     span = find_wrapper(code, version)
     if span is None:
@@ -328,14 +363,10 @@ def inner_decrypt(code, version):
     co = bytes(code.co_code)
     if body_is_plain(code, version, start, end, co, check_jumps=False):
         return None  # already plain
-    dec = decrypt_body(co[start:end], co[-16:])
-    cand = co[:start] + dec + co[end:]
-    if not body_is_plain(code, version, start, end, cand, check_jumps=False):
-        return None
-    return cand
+    return _decrypt_wrapped(code, version, start, end, co, consts)
 
 
-def strip_wrapper(code, version):
+def strip_wrapper(code, version, consts=(INNER_CONST,)):
     """Original bytecode of a wrap-mode code object with the wrapper removed.
 
     Decrypts the body if needed, rebases in-body absolute jumps, and turns
@@ -347,11 +378,9 @@ def strip_wrapper(code, version):
     start, end = span
     co = bytes(code.co_code)
     if not body_is_plain(code, version, start, end, co, check_jumps=False):
-        dec = decrypt_body(co[start:end], co[-16:])
-        cand = co[:start] + dec + co[end:]
-        if not body_is_plain(code, version, start, end, cand, check_jumps=False):
+        co = _decrypt_wrapped(code, version, start, end, co, consts)
+        if co is None:
             return None
-        co = cand
     opc = bc.opcode_module(version)
     unit = _unit(version)
     ret, nop, jabs = opc.opmap["RETURN_VALUE"], opc.opmap["NOP"], opc.opmap["JUMP_ABSOLUTE"]
@@ -405,21 +434,24 @@ def find_armor_stub(code, version):
     return co[jsize:stub], co[-16:]
 
 
-def recover_armor_stub(code, version):
+def recover_armor_stub(code, version, consts=(INNER_CONST,), oc2_consts=(OC2_CONST,)):
     """Decrypted co_code of a wrap_mode=0 ``__armor__`` code object, or None.
     Tries both obf_code=1 and obf_code=2 ciphers."""
     span = find_armor_stub(code, version)
     if span is None:
         return None
     body, nonce = span
-    for dec in (decrypt_body(body, nonce), decrypt_ctr(body, nonce)):
+    cands = [decrypt_body(body, nonce, c) for c in consts] + [decrypt_ctr(body, nonce, c) for c in oc2_consts]
+    for dec in cands:
         if len(dec) == len(body) and body_is_plain(code, version, 0, len(dec), co=dec, check_jumps=True):
             return dec
     return None
 
 
-def unwrap(blob: bc.CodeBlob):
+def unwrap(blob: bc.CodeBlob, consts=(INNER_CONST,), oc2_consts=(OC2_CONST,)):
     """Recover the bytecode of every wrapped code object in the module.
+    ``consts`` / ``oc2_consts`` are the obf_code=1 / obf_code=2 capsule
+    constants to try, in order.
 
     Returns (new_raw | None, recovered, encrypted, notes), where ``encrypted``
     counts code objects that could not be recovered."""
@@ -432,9 +464,9 @@ def unwrap(blob: bc.CodeBlob):
         if not wrapped and not armor:
             continue
         if wrapped:
-            new = strip_wrapper(code, blob.version) or inner_decrypt(code, blob.version)
+            new = strip_wrapper(code, blob.version, consts) or inner_decrypt(code, blob.version, consts)
         else:
-            new = recover_armor_stub(code, blob.version)
+            new = recover_armor_stub(code, blob.version, consts, oc2_consts)
         if new is None:
             encrypted += 1
             continue

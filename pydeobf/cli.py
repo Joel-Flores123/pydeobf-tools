@@ -20,6 +20,14 @@ def _version(s):
     return (int(parts[0]), int(parts[1]))
 
 
+def _pyarmor7_key(s):
+    from .pyarmor7 import parse_user_key
+    try:
+        return parse_user_key(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
 def _inputs(paths):
     for p in paths:
         p = Path(p)
@@ -50,6 +58,11 @@ def main(argv=None):
                     help="platform the emulated sys/os modules pretend to be")
     ap.add_argument("--pyarmor-runtime", help="path to pyarmor_runtime.{so,pyd,dylib} for PyArmor samples "
                     "(auto-detected near the input; the built-in trial key is used otherwise)")
+    ap.add_argument("--pyarmor7-key", metavar="FIX[:INNER[:OC2]]", action="append", default=[],
+                    type=_pyarmor7_key,
+                    help="PyArmor <= 7 capsule key (hex) to try when the built-in trial key fails; repeatable. "
+                    "FIX is the 16-byte module key; INNER (24 bytes) and OC2 (16 bytes) are the optional "
+                    "obf_code=1/2 function-body constants (trial ones are tried if omitted)")
     ap.add_argument("--no-pyarmor", action="store_true", help="do not attempt static PyArmor decryption")
     ap.add_argument("--no-fold", action="store_true", help="don't fold encoded constant expressions")
     ap.add_argument("--no-rename", action="store_true", help="don't rename non-Latin identifiers")
@@ -70,7 +83,7 @@ def main(argv=None):
                    pylingual_timeout=a.pylingual_timeout, pylingual_redis=a.pylingual_redis, max_steps=a.max_steps,
                    max_seconds=a.max_seconds, max_layers=a.max_layers, platform=a.platform, fold=not a.no_fold,
                    rename=not a.no_rename, blob_search=not a.no_blob_search, quiet=a.quiet,
-                   pyarmor_runtime=a.pyarmor_runtime, pyarmor=not a.no_pyarmor)
+                   pyarmor_runtime=a.pyarmor_runtime, pyarmor=not a.no_pyarmor, pyarmor7_keys=a.pyarmor7_key)
     files = list(_inputs(a.inputs))
     rc = 0
     used = set()

@@ -42,6 +42,7 @@ class Options:
     platform: str = "windows"
     pyarmor_runtime: str | None = None
     pyarmor: bool = True
+    pyarmor7_keys: list = field(default_factory=list)  # pyarmor7.UserKey, tried after the trial key
     fold: bool = True
     rename: bool = True
     blob_search: bool = True
@@ -112,6 +113,7 @@ class Engine:
         self.version_hint = self.o.version_hint
         self.emu: V.Emulator | None = None
         self.pyarmor: dict | None = None
+        self.pyarmor7_key = None  # UserKey that decrypted the module, if any
 
     # ------------------------------------------------------------ utils
 
@@ -271,12 +273,14 @@ class Engine:
         module = pa7.plain_module(blob, hdr)
         status = "plain marshal (obf-mod 0)"
         if module is None:
-            found = pa7.decrypted_module(blob, hdr)
+            users = {self._user_key_name(i): k for i, k in enumerate(self.o.pyarmor7_keys)}
+            found = pa7.decrypted_module(blob, hdr, {**pa7.KNOWN_FIX, **{n: k.fix for n, k in users.items()}})
             if found is None:
                 self.pyarmor["module"] = "encrypted"
                 lay.notes.append(pa7.NOTE_ENCRYPTED)
                 return True
             module, fix_name = found
+            self.pyarmor7_key = users.get(fix_name)
             status = f"decrypted ({fix_name} capsule key)"
             self.pyarmor["capsule_key"] = fix_name
             lay.notes.append(f"PyArmor 7: payload decrypted with the {fix_name} capsule key (AES-128-GCM)")
@@ -285,11 +289,27 @@ class Engine:
         self._pyarmor7_module(lay, module)
         return True
 
+    def _user_key_name(self, i):
+        return "user" if len(self.o.pyarmor7_keys) == 1 else f"user#{i + 1}"
+
+    def _pyarmor7_consts(self):
+        """obf_code=1 / obf_code=2 constants to try: the module key's first,
+        then the trial ones, then any other user-supplied ones."""
+        from . import pyarmor7 as pa7
+        keys = [self.pyarmor7_key] if self.pyarmor7_key else []
+        keys += [k for k in self.o.pyarmor7_keys if k is not self.pyarmor7_key]
+        inner = [k.inner for k in keys if k.inner]
+        oc2 = [k.oc2 for k in keys if k.oc2]
+        if self.pyarmor7_key is None:
+            return [pa7.INNER_CONST, *inner], [pa7.OC2_CONST, *oc2]
+        return list(dict.fromkeys([*inner[:1], pa7.INNER_CONST, *inner])), \
+            list(dict.fromkeys([*oc2[:1], pa7.OC2_CONST, *oc2]))
+
     def _pyarmor7_module(self, lay, module, in_place=False):
         """Unwrap ``module``'s code objects. Plain result -> normal code layer;
         bodies still encrypted -> opaque code layer plus a source skeleton."""
         from . import pyarmor7 as pa7
-        raw, stripped, encrypted, notes = pa7.unwrap(module)
+        raw, stripped, encrypted, notes = pa7.unwrap(module, *self._pyarmor7_consts())
         lay.notes.extend(notes)
         self.pyarmor = {**(self.pyarmor or {}), "unwrapped_code_objects": stripped,
                         "encrypted_code_objects": encrypted}

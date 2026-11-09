@@ -25,7 +25,7 @@ SIGNATURES = {
 _COMPILED = {k: [re.compile(p) for p in v] for k, v in SIGNATURES.items()}
 
 
-_ARMOR_CALL = re.compile(r"__pyarmor__\s*\(\s*__name__\s*,\s*__file__\s*,\s*b['\"](?:PY\d{6}|PYARMOR)")
+_ARMOR_CALL = re.compile(r"__pyarmor__\s*\(\s*__name__\s*,\s*__file__\s*,\s*b['\"](?:PY\d{6}|PYARMOR|(?i:\\x50\\x59\\x41\\x52\\x4d\\x4f\\x52))")
 _ARMOR_IMPORT = re.compile(r"^\s*from\s+(?:\S*\.)?(pyarmor_runtime_\d{6}|pytransform)\s+import\s+(?:__pyarmor__|pyarmor_runtime)",
                            re.M)
 
