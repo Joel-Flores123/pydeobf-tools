@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import os
 import struct
 from dataclasses import dataclass, field
 
@@ -547,7 +548,38 @@ class Unpacked:
     runtime_pkg: str | None
 
 
-def unpack(source: str, runtime_path=None, mix_str=True) -> Unpacked | None:
+_DIR_KEYS: dict = {}
+
+
+def keys_from_dir(runtime_dir) -> list:
+    """Unique keys of every usable runtime in a directory (bytes are only read, never loaded)."""
+    runtime_dir = str(runtime_dir)
+    if runtime_dir not in _DIR_KEYS:
+        found = {}
+        for f in sorted(os.listdir(runtime_dir)):
+            if f.endswith((".so", ".pyd", ".dylib", ".dll")):
+                try:
+                    k = RuntimeKey.from_runtime(os.path.join(runtime_dir, f))
+                except Exception:
+                    continue
+                found.setdefault((k.aes_key, k.mix_str_nonce), k)
+        _DIR_KEYS[runtime_dir] = list(found.values())
+    return _DIR_KEYS[runtime_dir]
+
+
+def find_key(blob: bytes, runtime_dir):
+    """The key in ``runtime_dir`` that decrypts ``blob`` (its marshal stream starts with a code object)."""
+    for k in keys_from_dir(runtime_dir):
+        try:
+            ms = decrypt_blob(blob, k).marshal_stream
+        except Exception:
+            continue
+        if ms and ms[0] & 0x7F == ord("c"):
+            return k
+    return None
+
+
+def unpack(source: str, runtime_path=None, mix_str=True, runtime_dir=None) -> Unpacked | None:
     """Statically unpack a PyArmor-obfuscated .py source string.
 
     runtime_path: a pyarmor_runtime.{so,pyd,dylib}; if omitted the built-in
@@ -564,6 +596,8 @@ def unpack(source: str, runtime_path=None, mix_str=True) -> Unpacked | None:
             key = RuntimeKey.from_runtime(runtime_path)
         except Exception:
             key = None
+    if key is None and runtime_dir:
+        key = find_key(blob, runtime_dir)
     if key is None:
         key = RuntimeKey.trial()
     module = decrypt_blob(blob, key)

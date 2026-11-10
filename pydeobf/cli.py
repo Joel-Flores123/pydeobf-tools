@@ -46,7 +46,7 @@ def main(argv=None):
     ap.add_argument("-o", "--out", help="output directory (default: <input>.deobf/; per-file subdirs for many inputs)")
     ap.add_argument("--py-version", type=_version, help="Python version hint for header-less marshal blobs, e.g. 3.9")
     ap.add_argument("--no-pylingual", action="store_true", help="never call PyLingual")
-    ap.add_argument("--decompile-all", action="store_true", help="also decompile wrapper layers")
+    ap.add_argument("--decompile-all", action="store_true", help="also decompile intermediate (non-final) layers")
     ap.add_argument("--pylingual-timeout", type=int, default=600)
     ap.add_argument("--pylingual-redis", metavar="HOST[:PORT]", default=os.environ.get("PYDEOBF_PYLINGUAL_REDIS"),
                     help="Redis server PyLingual uses to cache statement translations across runs "
@@ -58,6 +58,8 @@ def main(argv=None):
                     help="platform the emulated sys/os modules pretend to be")
     ap.add_argument("--pyarmor-runtime", help="path to pyarmor_runtime.{so,pyd,dylib} for PyArmor samples "
                     "(auto-detected near the input; the built-in trial key is used otherwise)")
+    ap.add_argument("--pyarmor-runtime-dir", help="directory of pyarmor_runtime.{so,pyd,dylib} files; the one whose key "
+                    "decrypts the sample is used (files are only read, never loaded)")
     ap.add_argument("--pyarmor7-key", metavar="FIX[:INNER[:OC2]]", action="append", default=[],
                     type=_pyarmor7_key,
                     help="PyArmor <= 7 capsule key (hex) to try when the built-in trial key fails; repeatable. "
@@ -83,7 +85,7 @@ def main(argv=None):
                    pylingual_timeout=a.pylingual_timeout, pylingual_redis=a.pylingual_redis, max_steps=a.max_steps,
                    max_seconds=a.max_seconds, max_layers=a.max_layers, platform=a.platform, fold=not a.no_fold,
                    rename=not a.no_rename, blob_search=not a.no_blob_search, quiet=a.quiet,
-                   pyarmor_runtime=a.pyarmor_runtime, pyarmor=not a.no_pyarmor, pyarmor7_keys=a.pyarmor7_key)
+                   pyarmor_runtime=a.pyarmor_runtime, pyarmor_runtime_dir=a.pyarmor_runtime_dir, pyarmor=not a.no_pyarmor, pyarmor7_keys=a.pyarmor7_key)
     files = list(_inputs(a.inputs))
     rc = 0
     used = set()

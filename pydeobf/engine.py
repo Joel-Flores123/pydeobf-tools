@@ -6,7 +6,7 @@ Input (.pyc or possibly-broken .py)
   -> each payload becomes a child layer, recursively
   -> fallbacks: broken-source salvage, blob brute-force, PyLingual decompile
      of code the emulator cannot handle
-  -> leaves (and substantial non-wrapper code layers) are decompiled with
+  -> only the final (leaf) layers are decompiled with
      PyLingual when they are bytecode, then cleaned up.
 """
 
@@ -41,6 +41,7 @@ class Options:
     max_layers: int = 400
     platform: str = "windows"
     pyarmor_runtime: str | None = None
+    pyarmor_runtime_dir: str | None = None
     pyarmor: bool = True
     pyarmor7_keys: list = field(default_factory=list)  # pyarmor7.UserKey, tried after the trial key
     fold: bool = True
@@ -225,7 +226,7 @@ class Engine:
             return
         runtime = self._resolve_runtime()
         try:
-            up = pa.unpack(lay.source, runtime_path=runtime)
+            up = pa.unpack(lay.source, runtime_path=runtime, runtime_dir=self.o.pyarmor_runtime_dir)
         except Exception as e:
             lay.notes.append(f"PyArmor unpack failed: {type(e).__name__}: {e}")
             return
@@ -424,7 +425,10 @@ class Engine:
         if res is not None:
             for p in res.payloads:
                 self._add_payload(lay, p)
-        # Fallback 1: bytecode the emulator could not follow -> decompile and retry at source level
+        # Fallback 1: bytecode the emulator could not follow -> look for an embedded blob statically first
+        # (cheap; avoids decompiling an intermediate layer), then decompile and retry at source level
+        if lay.kind == "code" and not lay.children and (res is None or res.error):
+            self._search_blobs(lay)
         if lay.kind == "code" and not lay.children and (res is None or res.error) and self.o.use_pylingual:
             self.decompile_layer(lay)
             if lay.decompiled:
@@ -548,12 +552,7 @@ class Engine:
     def finish(self):
         for lay in self.layers:
             leaf = not lay.children
-            if lay.kind == "code" and not lay.opaque and (leaf or self.o.decompile_all or not lay.wrapper):
-                size = sum(len(c.co_code) for c in bc.iter_code_objects(lay.blob.code))
-                if not leaf and not self.o.decompile_all and size > 200_000:
-                    lay.notes.append(f"not decompiled: {size} bytes of bytecode in a non-final layer "
-                                     "(use --decompile-all)")
-                    continue
+            if lay.kind == "code" and not lay.opaque and (leaf or self.o.decompile_all):
                 self.decompile_layer(lay)
         self.groups = []
         for group in self._leaf_groups():
