@@ -217,16 +217,17 @@ class Engine:
         return str(cands[0]) if cands else None
 
     def _try_pyarmor(self, lay):
-        """Statically decrypt a PyArmor-obfuscated source layer into a standard
+        """Statically decrypt a PyArmor-obfuscated layer (.py source or .pyc code) into a standard
         .pyc child layer. Never loads the runtime or runs the sample."""
-        if lay.kind != "source" or lay.children:
+        if lay.children:
             return
         from . import pyarmor as pa
-        if pa.find_pyarmor_blob(lay.source) is None:
+        src = lay.source if lay.kind == "source" else lay.blob.code
+        if (pa.find_pyarmor_blob(src) if lay.kind == "source" else pa.find_pyarmor_blob_code(src)) is None:
             return
         runtime = self._resolve_runtime()
         try:
-            up = pa.unpack(lay.source, runtime_path=runtime, runtime_dir=self.o.pyarmor_runtime_dir)
+            up = pa.unpack(src, runtime_path=runtime, runtime_dir=self.o.pyarmor_runtime_dir)
         except Exception as e:
             lay.notes.append(f"PyArmor unpack failed: {type(e).__name__}: {e}")
             return
@@ -336,6 +337,26 @@ class Engine:
         self.add_layer(target.index, "source", pa7.skeleton(module), "pyarmor7-skeleton")
 
     def _emulate(self, lay, code, version):
+        res = self._emulate_once(lay, code, version)
+        if res.stop_reason == "exit() called" and not res.payloads:
+            # an environment / anti-debug / licence gate decided on a fake value: retry stepping over exit guards
+            first, n_events = lay.emu, len(lay.events)
+            self.emu.skip_exit_guards = True
+            try:
+                res2 = self._emulate_once(lay, code, version)
+            finally:
+                self.emu.skip_exit_guards = False
+            if res2.payloads:
+                lay.notes.append("first emulation stopped at exit(); payload reached by skipping exit() guards")
+                return res2
+            tail = " | ".join(lay.events[-3:])
+            lay.notes.append(f"retry skipping exit() guards: {res2.error or res2.stop_reason or 'no payload'} "
+                             f"(last events: {tail[:300]})")
+            lay.emu = first
+            del lay.events[n_events:]
+        return res
+
+    def _emulate_once(self, lay, code, version):
         emu = self.emu
         emu.payloads = []
         emu.events = []

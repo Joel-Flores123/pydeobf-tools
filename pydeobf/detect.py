@@ -10,9 +10,17 @@ SIGNATURES = {
                 r"billythegoat356/Specter"],
     "Berserker": [r"class Berserker\(\)", r"_sparkle='''", r"\bBerserker\b[\s\S]*\b_sparkle\b"],
     "Kramer": [r"class Kramer\(\)", r"\bKramer\b[\s\S]*\b_sparkle\b"],
-    "Kyrie-Eleison": [r"Kyrie\._?(?:en|de)crypt", r"ζ"],
-    "PyObfuscate": [r"Obfuscated with PyObfuscate", r"__import__\('marshal'\)\.loads\(__\[::-1\]\)",
-                    r"exec\(str\(chr\(35\)(?:\+chr\(1\)){20}", r"_ = lambda __ : __import__\("],
+    # A lone "ζ" is ordinary text (Unicode tables, math, Greek); Kyrie's own class and method calls are not.
+    "Kyrie-Eleison": [r"\bclass Kyrie\b", r"Kyrie\._?(?:en|de)crypt", r"Kyrie\._ekyrie"],
+    # strings hidden as Greek-letter digits (_decrypt_basic) under AES, padded with junk classes; not Kyrie
+    "AES string-encryption (Greek map)": [r"'α':\s*'0',\s*'β':\s*'1',\s*'γ':\s*'2'[\s\S]*\b_decrypt_basic\w*\(",
+                                          r"\b_decrypt_basic\w*\([\s\S]*'α':\s*'0',\s*'β':\s*'1',\s*'γ':\s*'2'"],
+    # Statements only: tools/unpackers for PyObfuscate carry the same text inside string literals, so a match must
+    # not have a quote earlier on its line (and a header comment only counts as a comment).
+    "PyObfuscate": [r"(?m)^#\s*Obfuscated with PyObfuscate",
+                    r"(?m)^[^'\"\n]*__import__\('marshal'\)\.loads\(__\[::-1\]\)",
+                    r"(?m)^[^'\"\n]*exec\(str\(chr\(35\)(?:\+chr\(1\)){20}",
+                    r"(?m)^[^'\"\n]*_ = lambda __ ?: __import__\("],
     "pyminifier": [r"Created by pyminifier", r"exec\((?:bz2|zlib|lzma)\.decompress\(base64\.b64decode\('",
                    r"liftoff/pyminifier"],
     # PyArmor is decided structurally in pyarmor_evidence(); mentioning the
@@ -138,7 +146,8 @@ def embedded_payload_size(code) -> int:
 def detect_code_strings(strings, names=()) -> list[str]:
     text = "\n".join(s if isinstance(s, str) else s.decode("latin-1") for s in strings[:5000])
     text += "\n" + " ".join(names)
-    found = [d for d in detect_text(text) if d != "PyArmor"]
+    # PyObfuscate is statement-level source; in constants it is always a string literal (a tool or unpacker)
+    found = [d for d in detect_text(text) if d not in ("PyArmor", "PyObfuscate")]
     if pyarmor_evidence_code(set(names), strings):
         found.append("PyArmor")
     return found

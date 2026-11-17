@@ -15,6 +15,7 @@ import builtins
 import functools
 import marshal
 import operator
+import struct
 import sys
 import time
 import types
@@ -41,6 +42,10 @@ class VMUnsupported(VMSignal):
 
 class VMStop(VMSignal):
     """Emulation must stop (exit() called, budget exhausted, ...)."""
+
+
+class VMExitReturn(VMStop):
+    """exit() inside a function on the skip_exit_guards pass: the nearest emulated function returns None instead."""
 
 
 class VMRaise(VMSignal):
@@ -216,7 +221,9 @@ class VMClass(VMObject):
         return EMPTY
 
     def native_bases(self):
-        return [b for c in self.mro() for b in c.bases if not isinstance(b, VMClass)]
+        # an emulated types.ModuleType adds nothing an emulated instance lacks: treat it like object
+        return [b for c in self.mro() for b in c.bases if not isinstance(b, VMClass)
+                and not (isinstance(b, Special) and b.__name__ == "ModuleType")]
 
     def __call__(self, *args, **kwargs):
         return self.vm.call(self, args, kwargs)
@@ -319,6 +326,14 @@ class Special(VMObject):
         if self.module == "builtins" and isinstance(getattr(builtins, self.__name__, None), type):
             return f"<class '{self.__name__}'>"  # emulated type/super/...
         return f"<built-in function {self.__name__}>"
+
+
+class SuperProxy(VMObject):
+    """super(cls, obj): attribute lookup that starts after ``cls`` in obj's MRO."""
+
+    def __init__(self, cls, obj):
+        self.cls = cls
+        self.obj = obj
 
 
 class CodeRef(VMObject):
@@ -492,8 +507,10 @@ class Emulator:
         self.ctx: list[Payload] = []
         self._payload_keys = {}  # content key -> Payload
         self._dumped = {}  # marshal.dumps output -> the VMCompiled/CodeRef it came from
+        self._exc_types = {}  # id(VMClass) -> (VMClass, host exception subclass standing in for it)
         self.events: list[str] = []
         self.assumptions = 0
+        self.skip_exit_guards = False  # second pass: step over `if <env check>: exit()` whatever the fake value
         self.code_versions = {}
         self.builtins = safelib.make_builtins(self)
         self.builtins_module = SafeModule("builtins", self.builtins)
@@ -743,6 +760,14 @@ class Emulator:
             return self.call(fn.func, fn.args + tuple(args), {**fn.keywords, **kwargs})
         if isinstance(fn, HelperObject) and hasattr(fn, "__call__"):
             fn = fn.__call__
+        if fn is object.__new__ and args and isinstance(args[0], VMClass):
+            return VMInstance(args[0])
+        if fn is types.MethodType and len(args) == 2 and not kwargs:
+            return BoundMethod(args[0], args[1])
+        if fn is types.CodeType:
+            return self.make_code_type(*args, **kwargs)
+        if not callable(fn):
+            raise VMRaise(TypeError(f"'{type(fn).__name__}' object is not callable"))
         helper = isinstance(fn, types.MethodType) and isinstance(fn.__self__, HelperObject)
         if not helper and not safelib.is_safe_callable(fn):
             raise VMUnsupported(f"refusing to call non-allow-listed {describe(fn)} {getattr(fn, '__qualname__', '')}")
@@ -845,18 +870,28 @@ class Emulator:
             raise VMUnsupported("coroutines / async generators")
         if flags & 0x20:
             return VMGenerator(self, self._exec(f), fn.__name__)
-        return self.run_frame(f)
+        try:
+            return self.run_frame(f)
+        except VMExitReturn:
+            self.event(f"exit() in {fn.__name__}: returning None instead")
+            return None
 
     def instantiate(self, cls: VMClass, args, kwargs):
         nb = cls.native_bases()
         if nb:
             # Subclass of a host type (e.g. Exception): only allow pure data classes
-            if all(isinstance(b, type) and issubclass(b, BaseException) for b in nb):
-                return nb[0](*args)
+            exc_type = self.host_exc_type(cls)
+            if exc_type is not None:
+                return exc_type(*args)
             raise VMUnsupported(f"instantiating class with host base {nb}")
-        if cls.lookup("__new__") is not EMPTY:
-            raise VMUnsupported("custom __new__")
-        inst = VMInstance(cls)
+        new = cls.lookup("__new__")
+        if new is not EMPTY:
+            new = new.f if isinstance(new, StaticMethod) else new  # __new__ is an implicit staticmethod
+            inst = self.call(new, (cls,) + tuple(args), kwargs)
+            if not (isinstance(inst, VMInstance) and cls in inst.cls.mro()):
+                return inst  # __init__ only runs when __new__ returns an instance of cls
+        else:
+            inst = VMInstance(cls)
         init = cls.lookup("__init__")
         if init is not EMPTY:
             self.call(init, (inst,) + tuple(args), kwargs)
@@ -891,6 +926,23 @@ class Emulator:
         if isinstance(obj, SafeModule):
             return obj.get(name)
         if isinstance(obj, VMInstance):
+            ga = obj.cls.lookup("__getattribute__")
+            try:
+                if isinstance(ga, VMFunction):
+                    return self.call(ga, (obj, name), {})
+                return self.raw_getattr(obj, name)
+            except VMRaise as e:
+                gf = obj.cls.lookup("__getattr__")
+                if not isinstance(e.exc, AttributeError) or not isinstance(gf, VMFunction):
+                    raise
+                return self.call(gf, (obj, name), {})
+        return self._getattr_other(obj, name)
+
+    def raw_getattr(self, obj, name):
+        """object.__getattribute__: instance dict, then the class (no custom __getattribute__/__getattr__)."""
+        if not isinstance(obj, VMInstance):
+            return self.getattr(obj, name)
+        if True:
             if name == "__dict__":
                 return obj.dict
             if name == "__class__":
@@ -909,6 +961,8 @@ class Emulator:
             if isinstance(v, Property):
                 return self.call(v.fget, (obj,), {})
             return v
+
+    def _getattr_other(self, obj, name):
         if isinstance(obj, VMClass):
             if name == "__name__":
                 return obj.__name__
@@ -916,6 +970,10 @@ class Emulator:
                 return obj.ns
             v = obj.lookup(name)
             if v is EMPTY:
+                for nb in obj.native_bases():  # plain data from a host base, e.g. a namedtuple's _fields
+                    hv = getattr(nb, name, EMPTY) if isinstance(nb, type) else EMPTY
+                    if hv is not EMPTY and not callable(hv):
+                        return hv
                 raise VMRaise(AttributeError(f"type object '{obj.__name__}' has no attribute '{name}'"))
             if isinstance(v, ClassMethod):
                 return BoundMethod(v.f, obj)
@@ -940,6 +998,8 @@ class Emulator:
             if name == "__func__":
                 return obj.func
             return self.getattr(obj.func, name)
+        if isinstance(obj, SuperProxy):
+            return self.super_getattr(obj, name)
         if isinstance(obj, VMGenerator):
             if name in ("send", "close", "__next__"):
                 return getattr(obj, name if name != "__next__" else "__next__")
@@ -968,6 +1028,11 @@ class Emulator:
                 return getattr(obj, name)
             except AttributeError as e:
                 raise VMRaise(e)
+        if obj in (object, type) and name in ("__getattribute__", "__setattr__", "__delattr__"):
+            # object.__getattribute__(x, name): the emulator's own attribute protocol
+            fn = {"__getattribute__": self.raw_getattr, "__setattr__": self.raw_setattr,
+                  "__delattr__": lambda o, n: self.delattr(o, n)}[name]
+            return Special(name, fn, obj.__name__)
         if isinstance(obj, type) and name in ("__module__", "__name__", "__qualname__"):
             return getattr(obj, name)  # plain strings; anti-tamper checks probe these
         if isinstance(obj, type) and name == "__dict__":
@@ -978,6 +1043,12 @@ class Emulator:
         raise VMUnsupported(f"attribute {name!r} of {type(obj).__name__}")
 
     def setattr(self, obj, name, value):
+        if isinstance(obj, VMInstance) and isinstance(obj.cls.lookup("__setattr__"), VMFunction):
+            self.call(obj.cls.lookup("__setattr__"), (obj, name, value), {})
+            return
+        self.raw_setattr(obj, name, value)
+
+    def raw_setattr(self, obj, name, value):
         if isinstance(obj, VMInstance):
             p = obj.cls.lookup(name)
             if isinstance(p, Property) and p.fset is not None:
@@ -1092,9 +1163,34 @@ class Emulator:
         except Exception as e:
             raise VMRaise(e)
 
+    def host_exc_type(self, cls):
+        """A host exception subclass standing in for a VM-defined exception class, so raised instances keep their
+        class (``except Donuts:`` must catch ``raise Donuts()``). None if ``cls`` is not an exception class."""
+        cached = self._exc_types.get(id(cls))
+        if cached is not None:
+            return cached[1]
+        bases = []
+        for b in cls.bases:
+            if isinstance(b, VMClass):
+                b = self.host_exc_type(b)
+            if not (isinstance(b, type) and issubclass(b, BaseException)):
+                return None
+            bases.append(b)
+        if not bases:
+            return None
+        try:
+            t = type(cls.__name__, tuple(bases), {"__module__": "__main__"})
+        except TypeError:
+            return None
+        self._exc_types[id(cls)] = (cls, t)  # keep cls alive so its id is not reused
+        return t
+
     def exc_match(self, exc, typ):
         if isinstance(typ, tuple):
             return any(self.exc_match(exc, t) for t in typ)
+        if isinstance(typ, VMClass):
+            typ = self.host_exc_type(typ) if typ.native_bases() or any(isinstance(b, VMClass) for b in typ.bases) \
+                else None
         if isinstance(exc, BaseException):
             exc = type(exc)
         if isinstance(typ, type) and isinstance(exc, type):
@@ -1254,6 +1350,10 @@ class Emulator:
         if isinstance(data, Unknown):
             return Unknown("marshal of unknown")
         if not isinstance(data, (bytes, bytearray, memoryview)):
+            # Python 2 marshal data carried as a str (a py2 sample re-wrapped for py3): CPython 3 refuses it, but
+            # the latin-1 bytes are a Python 2 code object, so keep it as a recovered layer before raising.
+            if isinstance(data, str) and data[:1] == "c" and max(data, key=ord, default="\0") <= "\xff":
+                self._keep_py2_payload(data.encode("latin-1"))
             raise VMRaise(TypeError("marshal.loads() argument must be bytes-like"))
         data = bytes(data)
         if data in self._dumped:
@@ -1262,6 +1362,8 @@ class Emulator:
         if self.frames and self.frames[-1].version != HOST:
             hint = self.frames[-1].version
         blob = bc.load_marshal_best_effort(data, hint) if data[:1] in (b"c", b"\xe3") else None
+        if blob is None and data[:1] == b"c" and self._keep_py2_payload(data):
+            raise VMRaise(ValueError("bad marshal data (unknown type code)"))
         if blob is None:
             # not a code object: decode plain data (pure-Python unmarshaller)
             try:
@@ -1269,9 +1371,10 @@ class Emulator:
                 val = load_code(data, bc.magic_int_for(hint or HOST))
             except Exception:
                 raise VMRaise(ValueError("bad marshal data"))
-            if bc.is_code(val):
-                raise VMUnsupported("marshal code object of unknown version")
-            return val
+            if not bc.is_code(val):
+                return val
+            # a code object that fails the per-version sanity checks but loads as the running version: keep it
+            blob = bc.CodeBlob(val, tuple(hint or HOST), data, {"uncertain": True})
         self.version_hint = blob.version
         self.code_versions[id(blob.code)] = blob.version
         extra = ""
@@ -1285,6 +1388,20 @@ class Emulator:
             self.add_payload("code", blob, "marshal.loads", None, pending=True)
         return CodeRef(blob)
 
+    def _keep_py2_payload(self, raw):
+        """A Python 2 marshalled module inside a Python 3 sample: CPython 3 cannot load it, but it is the hidden
+        layer, so record it (pending) before the caller raises what CPython would."""
+        try:
+            code, used = bc.unmarshal(raw, (2, 7))
+        except Exception:
+            return False
+        if used != len(raw) or not bc.is_code(code) or getattr(code, "co_name", "") != "<module>":
+            return False
+        self.event(f"marshal.loads -> Python 2 code object ({len(raw)} bytes; CPython 3 refuses it)")
+        self.add_payload("code", bc.CodeBlob(code=code, version=(2, 7), raw=raw, meta={"detected": True}),
+                         "marshal.loads", None, pending=True)
+        return True
+
     def make_function_type(self, code, globals_=None, name=None, argdefs=None, closure=None):
         if isinstance(code, CodeRef):
             blob = code.blob
@@ -1296,7 +1413,9 @@ class Emulator:
         elif bc.is_code(code):
             blob = bc.CodeBlob(code, self.code_versions.get(id(code), self.frame.version))
         else:
-            raise VMUnsupported("FunctionType of non-code")
+            if isinstance(code, Unknown):
+                raise VMUnsupported("FunctionType of unknown code")
+            raise VMRaise(TypeError(f"function() argument 'code' must be code, not {type(code).__name__}"))
         if getattr(blob.code, "co_name", "") == "<module>":
             g = globals_ if isinstance(globals_, dict) else self.current_globals()
             p = self.add_payload("code", blob, "FunctionType", g)
@@ -1305,6 +1424,88 @@ class Emulator:
             return fn
         return VMFunction(self, blob.code, blob.version, globals_ if isinstance(globals_, dict) else self.current_globals(),
                           name=name, defaults=argdefs, closure=closure)
+
+    def make_super(self, *args):
+        if len(args) == 2:
+            return SuperProxy(*args)
+        if args:
+            raise VMUnsupported("one-argument super()")
+        f = self.frame  # super() runs inside the method that called it
+        cell = f.cells.get("__class__")
+        varnames = getattr(f.code, "co_varnames", ()) or ()
+        if cell is None or cell.value is EMPTY or not varnames:
+            raise VMRaise(RuntimeError("super(): __class__ cell not found"))
+        first = varnames[0]
+        obj = f.cells[first].value if first in f.cells else f.fast.get(first, EMPTY)
+        if obj is EMPTY:
+            raise VMRaise(RuntimeError("super(): no arguments"))
+        return SuperProxy(cell.value, obj)
+
+    def super_getattr(self, sp, name):
+        obj = sp.obj
+        start = obj.cls if isinstance(obj, VMInstance) else obj if isinstance(obj, VMClass) else None
+        if not isinstance(sp.cls, VMClass):
+            raise VMUnsupported("super() of a non-emulated class")
+        if start is None or not any(c is sp.cls for c in start.mro()):
+            raise VMRaise(TypeError("super(type, obj): obj must be an instance or subtype of type"))
+        mro = start.mro()
+        after = next((i for i, c in enumerate(mro) if c is sp.cls), len(mro))
+        for c in mro[after + 1:]:
+            if name in c.ns:
+                v = c.ns[name]
+                if isinstance(v, StaticMethod):
+                    return v.f
+                if isinstance(v, ClassMethod):
+                    return BoundMethod(v.f, start)
+                if isinstance(v, Property):
+                    return self.call(v.fget, (obj,), {})
+                if isinstance(v, VMFunction) and name != "__new__":
+                    return BoundMethod(v, obj)
+                return v
+        # past the emulated classes: object's own slots
+        if name == "__init__":
+            return Special("__init__", lambda *a, **k: None, "object")
+        if name == "__new__":
+            return object.__new__
+        if name in ("__getattribute__", "__getattr__"):
+            return Special(name, lambda n: self.raw_getattr(obj, n), "object")
+        if name == "__setattr__":
+            return Special(name, lambda n, v: self.raw_setattr(obj, n, v), "object")
+        if name == "__delattr__":
+            return Special(name, lambda n: self.delattr(obj, n), "object")
+        raise VMRaise(AttributeError(f"'super' object has no attribute '{name}'"))
+
+    def make_code_type(self, *args, **kwargs):
+        """types.CodeType(...) called by the sample: build the code object for the sample's own Python version."""
+        version = self.frame.version
+        fields = bc.codetype_fields(version)
+        if len(args) > len(fields) or len(args) < len(fields) - (2 if version >= (3, 11) else 0):
+            raise VMRaise(TypeError(f"code expected {len(fields)} arguments, got {len(args)}"))
+        f = dict(zip(fields, args), **kwargs)
+        f.setdefault("freevars", ()); f.setdefault("cellvars", ())
+        for v in f.values():
+            if isinstance(v, Unknown) or isinstance(v, tuple) and any(isinstance(x, Unknown) for x in v):
+                return Unknown("code object from unknown parts")
+
+        def dump_const(v):
+            if isinstance(v, CodeRef):
+                if v.blob.raw is None:
+                    raise VMUnsupported("CodeType with a nested code object of unknown bytes")
+                return v.blob.raw
+            if isinstance(v, tuple):
+                return b"(" + struct.pack("<I", len(v)) + b"".join(dump_const(x) for x in v)
+            if isinstance(v, frozenset):
+                return b"<" + struct.pack("<I", len(v)) + b"".join(dump_const(x) for x in v)
+            try:
+                return marshal.dumps(v, 2)  # version 2: no back-references, so pieces can be concatenated
+            except ValueError:
+                raise VMUnsupported(f"CodeType constant {describe(v)}")
+        try:
+            raw = bc.dump_code(f, version, dump_const)
+            code, _ = bc.unmarshal(raw, version)
+        except (KeyError, TypeError, ValueError, struct.error) as e:
+            raise VMRaise(TypeError(f"code(): {e}"))
+        return CodeRef(bc.CodeBlob(code, version, raw, {"origin": "types.CodeType"}))
 
     def import_(self, name, fromlist=None, level=0):
         if isinstance(name, Unknown):
@@ -1341,6 +1542,12 @@ class Emulator:
                 return FakeFile(data, file)
             return FakeFile(data.decode("utf-8", errors="ignore"), file)
         self.event(f"open({describe(file)}, {describe(mode)})")
+        if isinstance(file, str) and file.startswith("/proc/") and not any(c in str(mode) for c in "wax+"):
+            # procfs: absent on Windows, kernel data on Linux (answered as a clean desktop would)
+            data = safelib.FAKE_PROC.get(file) if self.platform == "linux" else None
+            if data is None:
+                raise VMRaise(FileNotFoundError(2, "No such file or directory", file))
+            return FakeFile(data.encode() if "b" in str(mode) else data, file)
         return Opaque(f"open({describe(file, 60)})")
 
 
@@ -1671,6 +1878,20 @@ def _load_attr(vm, f, ins):
     obj = f.stack.pop()
     v = vm.getattr(obj, ins.argval)
     method = f.version >= (3, 12) and ins.arg & 1
+    if method and f.version < (3, 13):
+        f.stack.append(NULL)
+    f.stack.append(v)
+    if method and f.version >= (3, 13):
+        f.stack.append(NULL)
+
+
+@handler("LOAD_SUPER_ATTR")
+def _load_super_attr(vm, f, ins):
+    obj = f.stack.pop()
+    cls = f.stack.pop()
+    f.stack.pop()  # the global super
+    v = vm.super_getattr(SuperProxy(cls, obj), f.code.co_names[ins.arg >> 2])
+    method = ins.arg & 1
     if method and f.version < (3, 13):
         f.stack.append(NULL)
     f.stack.append(v)
@@ -2170,7 +2391,16 @@ def _cond_jump(jump_if):
             return vm.unknown_branch(f, ins, None if not jump_if else None)
         if t == jump_if:
             return ins.argval
+        return _skip_exit_guard(vm, f, ins)
     return h
+
+
+def _skip_exit_guard(vm, f, ins):
+    """On the skip_exit_guards pass, jump over a fall-through body that calls exit() (None: fall through)."""
+    if vm.skip_exit_guards and isinstance(ins.argval, int) and _exits_before(f, ins):
+        vm.event(f"skipped exit guard at {f.code.co_name}:{ins.offset}")
+        return ins.argval
+    return None
 
 
 for _p in ("POP_JUMP_IF_", "POP_JUMP_FORWARD_IF_", "POP_JUMP_BACKWARD_IF_"):
@@ -2185,6 +2415,7 @@ def _none_jump(want_none):
             return vm.unknown_branch(f, ins, None)
         if (v is None) == want_none:
             return ins.argval
+        return _skip_exit_guard(vm, f, ins)
     return h
 
 
@@ -2252,7 +2483,8 @@ def _pop_except(vm, f, ins):
     while f.blocks:
         b = f.blocks.pop()
         if b.kind == "handler":
-            del f.stack[b.level:]
+            # pop the 3 saved exception values; a value ROT_FOUR'd under them (return in except) stays
+            del f.stack[max(b.level, len(f.stack) - 3):]
             break
     if f.handled:
         f.handled.pop()
@@ -2327,6 +2559,14 @@ def _setup_with(vm, f, ins):
     f.stack.append(res)
 
 
+@handler("LOAD_SPECIAL")
+def _load_special(vm, f, ins):
+    # 3.14: owner -> method, self_or_null (with/async with)
+    name = ("__enter__", "__exit__", "__aenter__", "__aexit__")[ins.arg]
+    f.stack.append(vm.getattr(f.stack.pop(), name))
+    f.stack.append(NULL)
+
+
 @handler("BEFORE_WITH")
 def _before_with(vm, f, ins):
     f.stack.append(_enter_ctx(vm, f))
@@ -2335,7 +2575,11 @@ def _before_with(vm, f, ins):
 @handler("WITH_EXCEPT_START")
 def _with_except_start(vm, f, ins):
     if f.version >= (3, 14):
-        raise VMUnsupported(f"opcode WITH_EXCEPT_START ({bc.vstr(f.version)})")
+        # exit_func, exit_self (NULL here: LOAD_SPECIAL pushes a bound method), lasti, prev_exc, val
+        exit_, self_, val = f.stack[-5], f.stack[-4], f.stack[-1]
+        args = (type(val), val, None) if self_ is NULL else (self_, type(val), val, None)
+        f.stack.append(vm.call(exit_, args, {}))
+        return
     # <3.11: exit, <prev tb, val, type>, tb, val, type; 3.11+: exit, lasti, prev_exc, val
     if f.version >= (3, 11):
         exit_, val = f.stack[-4], f.stack[-1]

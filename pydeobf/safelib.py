@@ -56,6 +56,8 @@ _ITER_TYPES = tuple({
 # sys.version_info as reported to emulated code that targets another Python version
 VersionInfo = collections.namedtuple("version_info", "major minor micro releaselevel serial")
 FrameInfo = collections.namedtuple("FrameInfo", "frame filename lineno function code_context index")  # inspect.stack()
+_SVMem = collections.namedtuple("svmem", "total available percent used free")  # psutil.virtual_memory()
+_SDiskUsage = collections.namedtuple("sdiskusage", "total used free percent")  # psutil.disk_usage()
 
 
 class SysModules(dict):
@@ -67,7 +69,7 @@ class SysModules(dict):
         return _vm.Opaque(f"sys.modules[{key!r}]")
 
 
-SAFE_INSTANCE_TYPES = frozenset(PRIMITIVE_TYPES + _ITER_TYPES + (VersionInfo, FrameInfo, SysModules))
+SAFE_INSTANCE_TYPES = frozenset(PRIMITIVE_TYPES + _ITER_TYPES + (VersionInfo, FrameInfo, _SVMem, _SDiskUsage, SysModules))
 
 # samples built for <=3.10 turn int-encoded payloads into text with str(n); 3.11+ caps that at 4300 digits
 if hasattr(sys, "set_int_max_str_digits"):
@@ -103,11 +105,28 @@ _allow(*[getattr(_b, n) for n in _PURE_BUILTINS])
 _allow(str.maketrans, bytes.maketrans, bytearray.maketrans)
 
 
+# namedtuple classes the sample made (plain tuple subclasses; their generated code is CPython's, not the sample's)
+_NAMEDTUPLES: set = set()
+
+
+def namedtuple(typename, field_names, *, rename=False, defaults=None, module=None):
+    names = field_names.replace(",", " ").split() if isinstance(field_names, str) else list(field_names)
+    if not isinstance(typename, str) or not all(isinstance(n, str) for n in names):
+        raise _vm.VMRaise(TypeError("Type names and field names must be strings"))
+    try:
+        cls = collections.namedtuple(typename, names, rename=bool(rename),
+                                     defaults=tuple(defaults) if defaults is not None else None, module="__main__")
+    except (ValueError, TypeError) as e:
+        raise _vm.VMRaise(e)
+    _NAMEDTUPLES.add(cls)
+    return cls
+
+
 def is_safe_callable(f) -> bool:
     if id(f) in _SAFE_IDS and _SAFE_IDS[id(f)] is f:
         return True
     if isinstance(f, type):
-        return f in SAFE_TYPES
+        return f in SAFE_TYPES or f in _NAMEDTUPLES
     if isinstance(f, (types.BuiltinMethodType, types.MethodWrapperType, types.MethodDescriptorType,
                       types.WrapperDescriptorType, types.ClassMethodDescriptorType)):
         owner = getattr(f, "__self__", None)
@@ -127,8 +146,8 @@ def attr_allowed(obj, name) -> bool:
     if name.startswith("__") and name not in SAFE_DUNDERS:
         return False
     if isinstance(obj, type):
-        return obj in SAFE_TYPES
-    return type(obj) in SAFE_INSTANCE_TYPES
+        return obj in SAFE_TYPES or obj in _NAMEDTUPLES and not callable(getattr(obj, name, None))
+    return type(obj) in SAFE_INSTANCE_TYPES or type(obj) in _NAMEDTUPLES and not callable(getattr(obj, name, None))
 
 
 # ------------------------------------------------------------------ guards
@@ -283,6 +302,29 @@ def codecs_decode(obj, encoding="utf-8", errors="strict"):
 
 _allow(zlib_decompress, bz2_decompress, lzma_decompress, gzip_decompress, codecs_decode)
 
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def base58_b58decode(v, alphabet=_B58.encode()):
+    """The third-party ``base58`` package's decoder (pure data)."""
+    if isinstance(v, str):
+        v = v.encode("ascii")
+    alpha = alphabet.decode() if isinstance(alphabet, bytes) else alphabet
+    v = v.rstrip(b"\n")
+    if len(v) > 1 << 20:  # big-int decoding is quadratic
+        raise _vm.VMStop("refusing huge argument to b58decode")
+    n = 0
+    for c in v.decode("ascii"):
+        i = alpha.find(c)
+        if i < 0:
+            raise ValueError(f"Invalid character {c!r}")
+        n = n * 58 + i
+    pad = len(v) - len(v.lstrip(alpha[0].encode()))
+    return b"\0" * pad + n.to_bytes((n.bit_length() + 7) // 8, "big")
+
+
+_allow(base58_b58decode)
+
 
 # ------------------------------------------------------------------ modules
 
@@ -332,6 +374,21 @@ ENV_PROBES = {
     "multiprocessing.cpu_count": 8, "os.cpu_count": 8,
     "os.getpid": 4242, "os.getppid": 4100, "os.getlogin": "user", "getpass.getuser": "user",
     "traceback.format_stack": [], "traceback.extract_stack": [],
+    "platform.version": {"windows": "10.0.19045", "linux": "#1 SMP PREEMPT_DYNAMIC"},
+    "platform.platform": {"windows": "Windows-10-10.0.19045-SP0", "linux": "Linux-6.5.0-x86_64-with-glibc2.35"},
+    "platform.processor": {"windows": "Intel64 Family 6 Model 158 Stepping 10, GenuineIntel", "linux": "x86_64"},
+    # psutil: a 16 GB / 8-core desktop that booted a while ago
+    "psutil.virtual_memory": _SVMem(17179869184, 8589934592, 50.0, 8589934592, 8589934592),
+    "psutil.disk_usage": _SDiskUsage(512110190592, 256055095296, 256055095296, 50.0),
+    "psutil.cpu_count": 8, "psutil.cpu_percent": 12.5, "psutil.boot_time": 1700000000.0,
+}
+
+
+FAKE_PROC = {
+    "/proc/uptime": "345678.12 2701234.56\n",
+    "/proc/version": "Linux version 6.5.0-41-generic (buildd@lcy02-amd64-001) (gcc 12.3.0) #41-Ubuntu SMP\n",
+    "/proc/meminfo": "MemTotal:       16777216 kB\nMemFree:         4194304 kB\nMemAvailable:    8388608 kB\n",
+    "/proc/loadavg": "0.42 0.37 0.31 1/812 4242\n",
 }
 
 
@@ -341,6 +398,18 @@ def env_probe(vm, path):
         return False, None
     v = ENV_PROBES[path]
     return True, (v[vm.platform] if isinstance(v, dict) else v)
+
+
+def _urandom(vm):
+    rng = random.Random(0x5EED)
+
+    def urandom(n):
+        if not isinstance(n, int) or not 0 <= n <= 1 << 20:
+            raise _vm.VMRaise(ValueError("negative argument not allowed") if isinstance(n, int) and n < 0
+                              else TypeError("urandom() argument must be a small int"))
+        vm.event(f"os.urandom({n})")
+        return bytes(rng.getrandbits(8) for _ in range(n))
+    return urandom
 
 
 def script_path(vm):
@@ -372,6 +441,7 @@ def _static_modules(platform):
                                  "encodebytes", "b32hexdecode", "b32hexencode"]),
         "zlib": {**_pick(zlib, ["compress", "crc32", "adler32", "MAX_WBITS", "DEFLATED", "error"]),
                  "decompress": zlib_decompress, "decompressobj": zlib_decompressobj},
+        "base58": {"b58decode": base58_b58decode, "BITCOIN_ALPHABET": _B58.encode()},
         "bz2": {"compress": bz2.compress, "decompress": bz2_decompress, "BZ2Decompressor": bz2_decompressor},
         "lzma": {"compress": lzma.compress, "decompress": lzma_decompress, "LZMADecompressor": lzma_decompressor,
                  **_pick(lzma, ["FORMAT_AUTO", "FORMAT_XZ", "FORMAT_ALONE", "FORMAT_RAW", "LZMAError"])},
@@ -402,7 +472,8 @@ def _static_modules(platform):
                    "Random": SeededRandom},
         "json": _pick(json, ["loads", "dumps", "JSONDecodeError"]),
         "ast": {"literal_eval": _ast.literal_eval},
-        "collections": _pick(collections, ["OrderedDict", "deque", "Counter", "defaultdict"]),
+        "collections": {**_pick(collections, ["OrderedDict", "deque", "Counter", "defaultdict"]),
+                        "namedtuple": _vm.Special("namedtuple", namedtuple, "collections")},
         "os.path": path_attrs,
         "ntpath": _pick(ntpath, list(path_attrs)),
         "posixpath": _pick(posixpath, list(path_attrs)),
@@ -529,6 +600,8 @@ def get_module(vm, name):
             # recorded, never performed (self-deleting samples; anti-tamper checks also probe their repr)
             **{n: _vm.Special(n, _fs_noop(vm, n), "nt" if win else "posix") for n in ("unlink", "remove", "rmdir")},
             "pathsep": ";" if win else ":", "curdir": ".", "pardir": "..",
+            # random bytes are random to the program too: any fixed value is as valid as a real one
+            "urandom": _vm.Special("urandom", _urandom(vm), "nt" if win else "posix"),
         })
     elif name == "threading":
         # a single main thread: anti-debug checks count threads (debuggers/injectors add some)
@@ -614,7 +687,7 @@ def make_builtins(vm):
 
     def _exit(*a):
         vm.event(f"exit({', '.join(V.describe(x) for x in a)})")
-        raise V.VMStop("exit() called")
+        raise (V.VMExitReturn if vm.skip_exit_guards else V.VMStop)("exit() called")
 
     def _print(*args, sep=" ", end="\n", file=None, flush=False):
         parts = []
@@ -806,7 +879,7 @@ def make_builtins(vm):
         "staticmethod": lambda f: V.StaticMethod(f),
         "classmethod": lambda f: V.ClassMethod(f),
         "property": lambda fget=None, fset=None, fdel=None, doc=None: V.Property(fget, fset, fdel, doc),
-        "super": lambda *a: (_ for _ in ()).throw(V.VMUnsupported("super()")),
+        "super": vm.make_super,
     }
     for k, fn in specials.items():
         B[k] = V.Special(k, fn)

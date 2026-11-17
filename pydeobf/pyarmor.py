@@ -128,6 +128,20 @@ def find_pyarmor_blob(source: str):
     return None
 
 
+def find_pyarmor_blob_code(code):
+    """find_pyarmor_blob for a code object (a .pyc): the b'PY...' constant of a
+    module that calls ``__pyarmor__``.  Only constants are read; nothing runs."""
+    runtime_pkg, blob = None, None
+    for c in bc.iter_code_objects(code):
+        for n in tuple(c.co_names) + tuple(k for k in c.co_consts if isinstance(k, str)):
+            if isinstance(n, str) and ("pyarmor_runtime" in n or n == "pytransform"):
+                runtime_pkg = runtime_pkg or n
+        if blob is None and "__pyarmor__" in c.co_names:
+            blob = next((k for k in c.co_consts if isinstance(k, bytes) and k[:2] == b"PY"
+                         and not k.startswith(b"PYARMOR")), None)
+    return (blob, {"runtime_pkg": runtime_pkg}) if blob is not None else None
+
+
 # --------------------------------------------------------------- outer blob
 
 @dataclass
@@ -285,6 +299,7 @@ class _Transcoder:
         self.key = key
         self.nonce_xor_key = nonce_xor_key
         self.mix_str = mix_str
+        self._in_consts = False   # mix strings only live in co_consts, never in co_code / line or exception tables
         if self.version not in _CODE_SHAPE:
             raise ValueError(f"unsupported Python version for PyArmor code objects: {self.version}")
 
@@ -343,7 +358,7 @@ class _Transcoder:
                 except Exception:
                     n.value = _MISS
             n.raw = self.d[start:self.pos]
-            if self.mix_str:
+            if self.mix_str and self._in_consts:
                 self._maybe_mix_str(n, b, t, raw_data)
             if n.raw == b"":
                 n.raw = self.d[start:self.pos]
@@ -371,6 +386,13 @@ class _Transcoder:
                 n.kids.append(self._read())   # value
             if any(k.dirty for k in n.kids):
                 n.dirty = True
+            n.raw = self.d[start:self.pos]
+            return n
+        elif t == ":":                           # slice (3.14+): start, stop, step
+            n = _Node("seq"); n.head = self.d[start:self.pos]
+            n.kids = [self._read() for _ in range(3)]
+            n.value = _MISS
+            n.dirty = any(k.dirty for k in n.kids)
             n.raw = self.d[start:self.pos]
             return n
         elif t == "r":                           # ref
@@ -412,14 +434,21 @@ class _Transcoder:
         flags = vals[-1]
         obf = bool(flags & CO_OBFUSCATED)
         lead_raw = self.d[lead_raw_start:self.pos]
+        outer = self._in_consts
+        self._in_consts = False
         # co_code (a bytes object)
         code_node = self._read()
-        # mid objects
-        mid_nodes = [self._read() for _ in range(mid)]
+        # mid objects (the first is co_consts)
+        mid_nodes = []
+        for i in range(mid):
+            self._in_consts = i == 0
+            mid_nodes.append(self._read())
+        self._in_consts = False
         # firstlineno i32
         firstlineno_raw = self.d[self.pos:self.pos + 4]; self.pos += 4
         # tail objects
         tail_nodes = [self._read() for _ in range(tail)]
+        self._in_consts = outer
 
         extra = None
         if obf:
@@ -567,26 +596,29 @@ def keys_from_dir(runtime_dir) -> list:
     return _DIR_KEYS[runtime_dir]
 
 
+def _decrypts(blob: bytes, key: RuntimeKey) -> bool:
+    """True if ``key`` decrypts ``blob`` (its marshal stream starts with a code object)."""
+    try:
+        ms = decrypt_blob(blob, key).marshal_stream
+    except Exception:
+        return False
+    return bool(ms) and ms[0] & 0x7F == ord("c")
+
+
 def find_key(blob: bytes, runtime_dir):
-    """The key in ``runtime_dir`` that decrypts ``blob`` (its marshal stream starts with a code object)."""
-    for k in keys_from_dir(runtime_dir):
-        try:
-            ms = decrypt_blob(blob, k).marshal_stream
-        except Exception:
-            continue
-        if ms and ms[0] & 0x7F == ord("c"):
-            return k
-    return None
+    """The key in ``runtime_dir`` that decrypts ``blob``."""
+    return next((k for k in keys_from_dir(runtime_dir) if _decrypts(blob, k)), None)
 
 
-def unpack(source: str, runtime_path=None, mix_str=True, runtime_dir=None) -> Unpacked | None:
-    """Statically unpack a PyArmor-obfuscated .py source string.
+def unpack(source, runtime_path=None, mix_str=True, runtime_dir=None) -> Unpacked | None:
+    """Statically unpack a PyArmor-obfuscated .py source string, or the module
+    code object of a .pyc.
 
     runtime_path: a pyarmor_runtime.{so,pyd,dylib}; if omitted the built-in
     trial key is used (correct for the free/trial PyArmor, serial 000000).
     Returns None if the source is not PyArmor-obfuscated.
     """
-    found = find_pyarmor_blob(source)
+    found = find_pyarmor_blob(source) if isinstance(source, str) else find_pyarmor_blob_code(source)
     if not found:
         return None
     blob, meta = found
@@ -596,8 +628,8 @@ def unpack(source: str, runtime_path=None, mix_str=True, runtime_dir=None) -> Un
             key = RuntimeKey.from_runtime(runtime_path)
         except Exception:
             key = None
-    if key is None and runtime_dir:
-        key = find_key(blob, runtime_dir)
+    if key is None and runtime_dir and not _decrypts(blob, RuntimeKey.trial()):
+        key = find_key(blob, runtime_dir)  # the "trial" key also differs between PyArmor releases
     if key is None:
         key = RuntimeKey.trial()
     module = decrypt_blob(blob, key)

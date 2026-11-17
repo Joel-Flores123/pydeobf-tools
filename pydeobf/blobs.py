@@ -12,6 +12,7 @@ import base64
 import binascii
 import codecs
 import re
+import zlib
 from collections import Counter
 from dataclasses import dataclass
 
@@ -96,7 +97,13 @@ def _t_zlib(v):
     b = _as_bytes(v)
     if b[:1] not in (b"x", b"\x08", b"\x18", b"\x28", b"\x38", b"\x48", b"\x58", b"\x68"):
         return None
-    return safelib.zlib_decompress(b)
+    try:
+        return safelib.zlib_decompress(b)
+    except zlib.error as e:
+        if "incorrect data check" not in str(e):
+            raise
+        # damaged Adler-32 trailer only: the deflate stream itself is intact
+        return safelib.zlib_decompress(b[2:-4], -15)
 
 
 def _t_gzip(v):

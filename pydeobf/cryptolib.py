@@ -85,8 +85,14 @@ class Cipher(_vm.HelperObject):
         return True
 
 
+def hmac_compare(a, b):
+    import hmac
+    return hmac.compare_digest(a, b)
+
+
 class HashObj(_vm.HelperObject):
-    ALLOWED = frozenset({"update", "digest", "hexdigest", "copy", "digest_size", "block_size", "name", "new"})
+    ALLOWED = frozenset({"update", "digest", "hexdigest", "copy", "digest_size", "block_size", "name", "new",
+                         "verify", "hexverify"})
 
     def __init__(self, h):
         self._h = h
@@ -103,6 +109,13 @@ class HashObj(_vm.HelperObject):
 
     def hexdigest(self):
         return self._h.hexdigest()
+
+    def verify(self, mac_tag):  # HMAC / CMAC objects (pycryptodome): ValueError on a wrong tag
+        if not hmac_compare(self._h.digest(), _bytes(mac_tag)):
+            raise _vm.VMRaise(ValueError("MAC check failed"))
+
+    def hexverify(self, hex_mac_tag):
+        self.verify(bytes.fromhex(hex_mac_tag))
 
     def copy(self):
         return HashObj(self._h.copy())
@@ -177,6 +190,8 @@ def _cipher_new(mod):
     def new(key, *args, **kwargs):
         args = tuple(_bytes(a) for a in args)
         kwargs = {k: (_bytes(v) if isinstance(v, (str, bytearray, memoryview)) else v) for k, v in kwargs.items()}
+        if mod in (ChaCha20, Salsa20, ChaCha20_Poly1305):  # keyword-only parameters
+            return Cipher(mod.new(key=_bytes(key), **kwargs))
         return Cipher(mod.new(_bytes(key), *args, **kwargs))
     new.__name__ = f"{mod.__name__.rsplit('.', 1)[-1]}.new"
     return new

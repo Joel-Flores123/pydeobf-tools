@@ -113,10 +113,22 @@ def patch_xdis_refs() -> None:
     def t_string(self, save_ref, bytes_for_s=False):
         return _orig_string(self, save_ref, bytes_for_s or tuple(self.version_triple[:1]) >= (3,))
 
+    # * before 3.11 CPython marshals co_varnames, co_freevars, co_cellvars, but xdis
+    #   reads cellvars first, so the two come out swapped (closures over a variable
+    #   that is both captured and passed on bind to the wrong cell).
+    _orig_code = U.t_code
+
+    def t_code(self, save_ref, bytes_for_s=False):
+        co = _orig_code(self, save_ref, bytes_for_s)
+        if (2, 1) <= tuple(self.version_triple[:2]) < (3, 11) and hasattr(co, "co_cellvars"):
+            co.co_cellvars, co.co_freevars = co.co_freevars, co.co_cellvars
+        return co
+
     t_long._pydeobf_fixed = True
     U.t_string = t_string
     U.t_long = t_long
     U.t_object_reference = t_object_reference
+    U.t_code = t_code
 
 
 patch_xdis_refs()
@@ -231,6 +243,54 @@ def unmarshal(raw: bytes, version):
 
 def is_code(obj) -> bool:
     return hasattr(obj, "co_code") and hasattr(obj, "co_consts")
+
+
+# types.CodeType(...) positional fields, by the Python version whose bytecode makes the call
+CODETYPE_FIELDS = {
+    (3, 11): ("argcount", "posonlyargcount", "kwonlyargcount", "nlocals", "stacksize", "flags", "code", "consts",
+              "names", "varnames", "filename", "name", "qualname", "firstlineno", "linetable", "exceptiontable",
+              "freevars", "cellvars"),
+    (3, 8): ("argcount", "posonlyargcount", "kwonlyargcount", "nlocals", "stacksize", "flags", "code", "consts",
+             "names", "varnames", "filename", "name", "firstlineno", "linetable", "freevars", "cellvars"),
+    (3, 7): ("argcount", "kwonlyargcount", "nlocals", "stacksize", "flags", "code", "consts", "names", "varnames",
+             "filename", "name", "firstlineno", "linetable", "freevars", "cellvars"),
+}
+
+
+def codetype_fields(version):
+    return CODETYPE_FIELDS[(3, 11) if version >= (3, 11) else (3, 8) if version >= (3, 8) else (3, 7)]
+
+
+def dump_code(f: dict, version, dump_const) -> bytes:
+    """Marshal a code object for ``version`` from its CodeType fields (no pyc header).
+    ``dump_const`` serialises one constant (nested code objects included)."""
+    i32 = lambda v: struct.pack("<i", v)
+    obj = dump_const
+    names = lambda seq: dump_const(tuple(seq))
+    out = bytearray(b"c")
+    if version >= (3, 11):
+        # locals-plus: arguments/locals (0x20), cells (0x40, or 0x60 for a cell argument), frees (0x80)
+        lp, kinds = list(f["varnames"]), [0x20] * len(f["varnames"])
+        for c in f["cellvars"]:
+            if c in lp:
+                kinds[lp.index(c)] |= 0x40
+            else:
+                lp.append(c); kinds.append(0x40)
+        lp += list(f["freevars"]); kinds += [0x80] * len(f["freevars"])
+        out += i32(f["argcount"]) + i32(f["posonlyargcount"]) + i32(f["kwonlyargcount"]) + i32(f["stacksize"]) \
+            + i32(f["flags"])
+        out += obj(bytes(f["code"])) + obj(f["consts"]) + names(f["names"]) + names(lp) + obj(bytes(kinds))
+        out += obj(f["filename"]) + obj(f["name"]) + obj(f["qualname"]) + i32(f["firstlineno"])
+        out += obj(bytes(f["linetable"])) + obj(bytes(f["exceptiontable"]))
+    else:
+        out += i32(f["argcount"])
+        if version >= (3, 8):
+            out += i32(f["posonlyargcount"])
+        out += i32(f["kwonlyargcount"]) + i32(f["nlocals"]) + i32(f["stacksize"]) + i32(f["flags"])
+        out += obj(bytes(f["code"])) + obj(f["consts"]) + names(f["names"]) + names(f["varnames"])
+        out += names(f["freevars"]) + names(f["cellvars"]) + obj(f["filename"]) + obj(f["name"])
+        out += i32(f["firstlineno"]) + obj(bytes(f["linetable"]))
+    return bytes(out)
 
 
 def iter_code_objects(code):
