@@ -13,6 +13,7 @@ Input (.pyc or possibly-broken .py)
 from __future__ import annotations
 
 import ast
+import re
 import hashlib
 import json
 import ntpath
@@ -27,6 +28,9 @@ from . import detect
 from . import pylingual_bridge
 from . import repair
 from . import vm as V
+
+
+_EMPTY_PYARMOR = re.compile(r"from (\w+) import __pyarmor__\s*\n\s*__pyarmor__\(__name__, __file__, b(''|\"\")\)")
 
 
 @dataclass
@@ -73,6 +77,7 @@ class Layer:
     _bcc: list = field(default_factory=list)  # PyArmor BCC native segments
     opaque: bool = False  # bytecode still encrypted (PyArmor 7): don't emulate or decompile
     files: dict = field(default_factory=dict)
+    run_globals: dict | None = None  # module namespace after this layer's emulation (string decryptors)
 
     @property
     def version(self):
@@ -354,6 +359,13 @@ class Engine:
                              f"(last events: {tail[:300]})")
             lay.emu = first
             del lay.events[n_events:]
+        if not res.payloads and res.globals is not None:
+            n_events = len(self.emu.events)
+            if self.emu.probe_uncalled(res.globals):
+                res.payloads = self.emu.payloads
+                lay.emu["payloads"] = len(res.payloads)
+                lay.notes.append("payload reached by calling a loader function the module defines but never calls")
+                lay.events.extend(self.emu.events[n_events:])
         return res
 
     def _emulate_once(self, lay, code, version):
@@ -367,6 +379,7 @@ class Engine:
         g = lay.globals if lay.globals is not None else emu.new_globals()
         t0 = time.monotonic()
         res = emu.run(code, version, g)
+        lay.run_globals = res.globals
         lay.emu = {"error": res.error, "stopped": res.stop_reason, "steps": res.steps,
                    "unknown_branches": res.assumptions, "seconds": round(time.monotonic() - t0, 3),
                    "payloads": len(res.payloads)}
@@ -437,6 +450,9 @@ class Engine:
             code = self._compile_source(lay)
             if code is not None:
                 res = self._emulate(lay, code, bc.HOST_VERSION)
+        elif lay.blob.code.co_flags & 0x2 and (lay.blob.code.co_argcount or lay.blob.code.co_flags & 0xC):
+            # CO_NEWLOCALS with parameters (or *args/**kwargs): a decrypted function body, not a module
+            lay.notes.append("decrypted function body; not emulated as a module (it needs its arguments)")
         else:
             if lay.blob.version in bc.EMULATED_VERSIONS:
                 res = self._emulate(lay, lay.blob.code, lay.blob.version)
@@ -461,6 +477,10 @@ class Engine:
         # Fallback 2: brute-force decode long constants
         if not lay.children:
             self._search_blobs(lay)
+        elif lay.kind == "code" and self.o.blob_search and res is not None and (res.error or res.stop_reason):
+            # emulation stopped early (licence gate, exit, ...): bodies it never reached, each XORed with a key
+            # beside it, are still recoverable statically
+            self._add_blobs(lay, blobs.search_keyed(bc.keyed_blobs(lay.blob.code, blobs.MIN_BLOB), self.version_hint))
         if lay.kind == "code" and lay.children:
             lay.wrapper = self._is_wrapper(lay)
 
@@ -468,7 +488,13 @@ class Engine:
         if not self.o.blob_search:
             return
         consts = self._constants(lay)
-        for cand in blobs.search_many(consts, self.version_hint):
+        found = blobs.search_many(consts, self.version_hint)
+        if not found and lay.kind == "code":
+            found = blobs.search_keyed(bc.keyed_blobs(lay.blob.code, blobs.MIN_BLOB), self.version_hint)
+        self._add_blobs(lay, found)
+
+    def _add_blobs(self, lay, found):
+        for cand in found:
             child = self.add_layer(lay.index, cand.kind, cand.value, "blob:" + "+".join(cand.chain),
                                    lay.globals)
             if child is not None:
@@ -496,6 +522,10 @@ class Engine:
             if self._trivial_source(p.value):
                 return
             if p.value.lstrip().startswith(("#", "\x01")) and self._trivial_source(p.value.replace("\x01", "")):
+                return
+            if _EMPTY_PYARMOR.fullmatch(p.value.strip()):
+                # a loader assembling a PyArmor payload from files the sample does not include: nothing to recover
+                lay.notes.append(f"{p.via} runs a PyArmor bootstrap with an empty payload (data from missing files)")
                 return
         else:
             if self._trivial_code(p.value.code):
@@ -582,8 +612,10 @@ class Engine:
             if not texts:
                 continue
             merged = "\n".join(t.rstrip("\n") + "\n" for t in texts)
+            merged, dnotes = self._fold_decryptor_calls(group[0], merged)
             env = self._env_for(group[0])
             final, notes = cleanup.clean(merged, fold=self.o.fold, rename=self.o.rename, env=env)
+            notes = dnotes + notes
             banner = "".join(_comment_header(l.salvaged)
                              for l in group if l.salvaged)
             if banner and not final.startswith(banner):
@@ -608,6 +640,110 @@ class Engine:
                 for other in group[1:]:
                     other.notes.append(f"merged into layer {head.index}")
             self.groups.append(group)
+
+    def _fold_decryptor_calls(self, lay, src, budget=60.0):
+        """Per-string encryption (``print(_dec('8fK2...', 'key'))`` everywhere, no hidden code layer): call each
+        function the sample defines on the constant arguments it is given and put the strings back in place."""
+        g = lay.run_globals
+        if not g or not self.o.fold:
+            return src, []
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            return self._fold_decryptor_calls_text(g, src, budget)
+        by_fn = {}
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and not n.keywords and n.args
+                    and isinstance(g.get(n.func.id), V.VMFunction) and hasattr(n, "end_lineno")):
+                continue
+            if not all(isinstance(a, ast.Constant) and isinstance(a.value, (str, bytes, int)) for a in n.args):
+                continue
+            if any(isinstance(a.value, (str, bytes)) and len(a.value) >= 8 for a in n.args):
+                by_fn.setdefault(n.func.id, []).append(n)
+        if not by_fn:
+            return src, []
+        lines = re.findall(r"[^\n]*\n|[^\n]+$", src)  # str.splitlines also breaks at \x0c, \x1c, ... unlike ast
+        starts = [0]
+        for ln in lines:
+            starts.append(starts[-1] + len(ln))
+
+        def pos(lineno, col):  # ast columns count UTF-8 bytes
+            return starts[lineno - 1] + len(lines[lineno - 1].encode("utf-8")[:col].decode("utf-8", "ignore"))
+
+        edits, counts = [], {}
+        deadline = time.monotonic() + budget
+        for name, calls in by_fn.items():
+            fn, ok = g[name], []
+            for i, n in enumerate(calls[:2000]):
+                if time.monotonic() > deadline or i == 5 and not ok:  # not a decryptor: stop early
+                    break
+                v = self.emu.eval_call(fn, [a.value for a in n.args])
+                if isinstance(v, str) and v.isprintable() or isinstance(v, bytes) and v:
+                    if all(v != a.value for a in n.args):
+                        ok.append((n, v))
+            if ok and len(ok) * 2 >= len(calls):  # a decryptor, not a helper that happened to return a str once
+                counts[name] = len(ok)
+                for n, v in ok:
+                    edits.append((pos(n.lineno, n.col_offset), pos(n.end_lineno, n.end_col_offset), repr(v)))
+        if not edits:
+            return src, []
+        out, last = [], len(src)
+        for a, b, text in sorted(edits, reverse=True):
+            if b > last:  # nested in an already-replaced call
+                continue
+            out.append(src[b:last])
+            out.append(text)
+            last = a
+        out.append(src[:last])
+        new = "".join(reversed(out))
+        try:
+            ast.parse(new)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            return src, []
+        total = sum(counts.values())
+        return new, [f"decrypted {total} encrypted string constants in place by calling "
+                     + ", ".join(f"{k}() ({c}x)" for k, c in counts.items())]
+
+    _LIT = r"""(?:[rRbBuU]{0,2}(?:'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")|-?\d+)"""
+
+    def _fold_decryptor_calls_text(self, g, src, budget):
+        """_fold_decryptor_calls for source that does not parse: literal-argument calls found lexically."""
+        names = [k for k, v in g.items() if isinstance(v, V.VMFunction) and isinstance(k, str) and k.isidentifier()]
+        if not names:
+            return src, []
+        call = re.compile(r"(?<![\w.])(" + "|".join(map(re.escape, names)) + r")\(\s*(" + self._LIT
+                          + r"(?:\s*,\s*" + self._LIT + r")*)\s*\)")
+        by_fn = {}
+        for m in call.finditer(src):
+            try:
+                args = ast.literal_eval("(" + m.group(2) + ",)")
+            except (SyntaxError, ValueError, RecursionError, MemoryError):
+                continue
+            if any(isinstance(a, (str, bytes)) and len(a) >= 8 for a in args):
+                by_fn.setdefault(m.group(1), []).append((m, args))
+        edits, counts = [], {}
+        deadline = time.monotonic() + budget
+        for name, calls in by_fn.items():
+            ok = []
+            for i, (m, args) in enumerate(calls[:2000]):
+                if time.monotonic() > deadline or i == 5 and not ok:
+                    break
+                v = self.emu.eval_call(g[name], list(args))
+                if (isinstance(v, str) and v.isprintable() or isinstance(v, bytes) and v) and v not in args:
+                    ok.append((m, v))
+            if ok and len(ok) * 2 >= len(calls):
+                counts[name] = len(ok)
+                edits.extend((m.start(), m.end(), repr(v)) for m, v in ok)
+        if not edits:
+            return src, []
+        out, last = [], len(src)
+        for a, b, text in sorted(edits, reverse=True):
+            out.append(src[b:last])
+            out.append(text)
+            last = a
+        out.append(src[:last])
+        return "".join(reversed(out)), [f"decrypted {sum(counts.values())} encrypted string constants in place by "
+                                        "calling " + ", ".join(f"{k}() ({c}x)" for k, c in counts.items())]
 
     def _leaf_groups(self):
         """Consecutive leaf siblings (same parent) form one program, e.g. code

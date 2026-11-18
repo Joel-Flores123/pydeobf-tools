@@ -241,6 +241,43 @@ def rename_nonlatin(tree, notes):
     return tree
 
 
+# a string literal (any prefix, single or triple quoted) or a comment: skipped by the lexical rename
+_LEX_SKIP = re.compile(r"""(?:\b[rRbBuUfF]{0,2})?(?:\'\'\'[\s\S]*?\'\'\'|\"\"\"[\s\S]*?\"\"\"|'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*")|#[^\n]*""")
+_LEX_NAME = re.compile(r"[^\W\d]\w*")
+
+
+def rename_nonlatin_tokens(src, notes):
+    """rename_nonlatin for source ast cannot parse (a decompiler's best effort around junk control flow): the
+    same _obfN names, applied to identifier tokens.  Strings and comments are left alone."""
+    mapping = {}
+
+    def new(name):
+        if name.isascii():
+            return name
+        if name not in mapping:
+            mapping[name] = f"_obf{len(mapping)}"
+        return mapping[name]
+
+    try:
+        import io
+        import tokenize
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+        out = tokenize.untokenize([(t.type, new(t.string) if t.type == tokenize.NAME else t.string,
+                                    t.start, t.end, t.line) for t in toks])
+    except (tokenize.TokenError, SyntaxError, ValueError, RecursionError):
+        mapping.clear()
+        parts, pos = [], 0
+        for m in _LEX_SKIP.finditer(src):
+            parts.append(_LEX_NAME.sub(lambda n: new(n.group()), src[pos:m.start()]))
+            parts.append(m.group())
+            pos = m.end()
+        parts.append(_LEX_NAME.sub(lambda n: new(n.group()), src[pos:]))
+        out = "".join(parts)
+    if mapping:
+        notes.append(f"renamed {len(mapping)} non-Latin identifiers to _obfN (token level; source does not parse)")
+    return out
+
+
 # ------------------------------------------------------------ const folding
 
 
@@ -695,7 +732,10 @@ def clean(src: str, *, fold=True, rename=True, inline=True, env=None) -> tuple[s
     try:
         tree = ast.parse(src)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
-        return src, notes + ["source does not parse; AST clean-up skipped"]
+        notes.append("source does not parse; AST clean-up skipped")
+        if rename:  # decompiler output that does not parse can still have its names made readable
+            src = rename_nonlatin_tokens(src, notes)
+        return src, notes
     before = len(notes)
     if env:
         tree = propagate_globals(tree, env, notes)

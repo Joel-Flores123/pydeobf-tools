@@ -96,11 +96,18 @@ def patch_xdis_refs() -> None:
     _orig_long = U.t_long
 
     def t_long(self, save_ref, bytes_for_s=False):
-        pos = self.fp.tell()
-        if self.fp.read(4) == b"\0\0\0\0":
+        # 15-bit digits, least significant first. xdis adds them one by one (quadratic: a payload stored as a
+        # 500 KB int never finishes); join them as a binary string instead, which int() parses in linear time
+        n = struct.unpack("<i", self.fp.read(4))[0]
+        if n == 0:
             return self.r_ref(0, save_ref)
-        self.fp.seek(pos)
-        return _orig_long(self, save_ref, bytes_for_s)
+        size = abs(n)
+        raw = self.fp.read(2 * size)
+        if len(raw) < 2 * size:
+            raise EOFError("marshal data too short (long)")
+        digits = struct.unpack(f"<{size}h", raw)
+        d = int("".join(format(x & 0x7FFF, "015b") for x in reversed(digits)), 2)
+        return self.r_ref(-d if n < 0 else d, save_ref)
 
     def t_object_reference(self, save_ref=None, bytes_for_s=False):
         refnum = self.read_uint32()
@@ -113,22 +120,87 @@ def patch_xdis_refs() -> None:
     def t_string(self, save_ref, bytes_for_s=False):
         return _orig_string(self, save_ref, bytes_for_s or tuple(self.version_triple[:1]) >= (3,))
 
-    # * before 3.11 CPython marshals co_varnames, co_freevars, co_cellvars, but xdis
-    #   reads cellvars first, so the two come out swapped (closures over a variable
-    #   that is both captured and passed on bind to the wrong cell).
+    # * before 3.11 CPython marshals co_varnames, co_freevars, co_cellvars; some xdis
+    #   releases read cellvars first, so the two come out swapped (closures over a
+    #   variable that is both captured and passed on bind to the wrong cell). Whether
+    #   this xdis does is probed once (see _xdis_swaps_cells), so a fixed xdis is left alone.
     _orig_code = U.t_code
 
     def t_code(self, save_ref, bytes_for_s=False):
         co = _orig_code(self, save_ref, bytes_for_s)
-        if (2, 1) <= tuple(self.version_triple[:2]) < (3, 11) and hasattr(co, "co_cellvars"):
+        if (2, 1) <= tuple(self.version_triple[:2]) < (3, 11) and hasattr(co, "co_cellvars") \
+                and _xdis_swaps_cells():
             co.co_cellvars, co.co_freevars = co.co_freevars, co.co_cellvars
         return co
 
+    # xdis grows tuples / sets with ``ret += (item,)``: quadratic, so a payload holding a tuple of a million ints
+    # never finishes. Collect into a list and build once.
+    def _seq(self, n, save_ref, bytes_for_s, make):
+        _, i = self.r_ref_reserve(make(()), save_ref)
+        items = [self.r_object(bytes_for_s=bytes_for_s) for _ in range(n)]
+        return self.r_ref_insert(make(items), i)
+
+    def t_tuple(self, save_ref, bytes_for_s=False):
+        return _seq(self, self.read_uint32(), save_ref, bytes_for_s, tuple)
+
+    def t_small_tuple(self, save_ref, bytes_for_s=False):
+        return _seq(self, struct.unpack("B", self.fp.read(1))[0], save_ref, bytes_for_s, tuple)
+
+    def t_set(self, save_ref, bytes_for_s=False):
+        return _seq(self, self.read_uint32(), save_ref, bytes_for_s, set)
+
     t_long._pydeobf_fixed = True
     U.t_string = t_string
-    U.t_long = t_long
     U.t_object_reference = t_object_reference
     U.t_code = t_code
+    # the linear readers below parse the marshal format themselves and only use these reader primitives;
+    # if a future xdis renames them, keep xdis' own (slow but correct) readers
+    if all(hasattr(U, a) for a in ("r_ref", "r_ref_reserve", "r_ref_insert", "r_object", "read_uint32")):
+        fast_long = t_long
+
+        def t_long(self, save_ref, bytes_for_s=False):
+            return fast_long(self, save_ref, bytes_for_s) if hasattr(self, "fp") else \
+                _orig_long(self, save_ref, bytes_for_s)
+        t_long._pydeobf_fixed = True
+        U.t_long = t_long
+        U.t_tuple = t_tuple
+        U.t_small_tuple = t_small_tuple
+        U.t_set = t_set
+    else:
+        U.t_long = _mark_fixed(_orig_long)
+
+
+def _mark_fixed(fn):
+    def wrapped(self, *a, **k):
+        return fn(self, *a, **k)
+    wrapped._pydeobf_fixed = True
+    return wrapped
+
+
+_SWAPS_CELLS = None
+
+
+def _xdis_swaps_cells() -> bool:
+    """Does this xdis read a <= 3.10 code object's co_cellvars / co_freevars swapped? Probed once on a code
+    object written here byte by byte (cellvars=('c',), freevars=('f',)), so the fix-up follows xdis
+    rather than assuming its bug."""
+    global _SWAPS_CELLS
+    if _SWAPS_CELLS is None:
+        _SWAPS_CELLS = False  # while probing, and if the probe cannot tell
+        i32 = lambda v: struct.pack("<i", v)
+        name = lambda t: b"z" + bytes([len(t)]) + t.encode()
+        tup = lambda *xs: b")" + bytes([len(xs)]) + b"".join(xs)
+        raw = (b"c" + i32(0) + i32(0) + i32(0) + i32(1) + i32(1) + i32(0)          # 3.8: argcount .. flags
+               + b"s" + i32(4) + b"d\x00S\x00"                                     # LOAD_CONST 0; RETURN_VALUE
+               + tup(b"N") + tup() + tup(name("v"))                                 # consts, names, varnames
+               + tup(name("f")) + tup(name("c"))                                    # freevars, cellvars
+               + name("p") + name("p") + i32(1) + b"s" + i32(0))                    # filename, name, line, lnotab
+        try:
+            co, _ = unmarshal(raw, (3, 8))
+            _SWAPS_CELLS = tuple(co.co_cellvars) == ("f",) and tuple(co.co_freevars) == ("c",)
+        except Exception:
+            pass
+    return _SWAPS_CELLS
 
 
 patch_xdis_refs()
@@ -155,10 +227,68 @@ def _lenient_fmt(fn):
     return wrapped
 
 
+class _Labels(list):
+    """A list (what xdis expects from findlabels) whose ``in`` is a set lookup: xdis tests ``offset in labels``
+    for every instruction, which is quadratic on a huge function."""
+
+    def __init__(self, items=()):
+        super().__init__(items)
+        self._set = set(self)
+
+    def __contains__(self, x):
+        return x in self._set
+
+    def append(self, x):
+        super().append(x)
+        self._set.add(x)
+
+    def extend(self, xs):
+        xs = list(xs)
+        super().extend(xs)
+        self._set.update(xs)
+
+
+def _fast_findlabels(orig):
+    """xdis's findlabels de-duplicates with ``label not in list``: quadratic on a function with 100k jumps.
+    Linear, and computed from the opcode tables here (backward jumps included). Falls back to xdis' own
+    if the helpers it borrows ever move."""
+    try:
+        from xdis.cross_dis import get_cache_size_313, unpack_opargs_bytecode_310
+        from xdis.wordcode import unpack_opargs_wordcode
+    except ImportError:
+        return orig
+
+    def findlabels(code, opc):
+        v = tuple(opc.version_tuple[:2])
+        if v < (3, 6):
+            return orig(code, opc)
+        unpack = unpack_opargs_wordcode if v < (3, 10) else unpack_opargs_bytecode_310
+        labels = {}
+        for offset, op, arg in unpack(code, opc):
+            if arg is None:
+                continue
+            if op in opc.JREL_OPS:
+                if v >= (3, 11) and opc.opname[op] in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT"):
+                    arg = -arg
+                label = offset + 2 + (arg * 2 if v >= (3, 10) else arg)
+                if v >= (3, 13):
+                    label += 2 * get_cache_size_313(opc.opname[op])
+            elif op in opc.JABS_OPS:
+                label = arg * 2 if v >= (3, 10) else arg
+            else:
+                continue
+            labels[label] = None
+        return _Labels(labels)
+    findlabels._orig = orig
+    return findlabels
+
+
 def opcode_module(version):
     key = tuple(version[:2])
     if key not in _OPC_CACHE:
         opc = get_opcode_module(key, PythonImplementation.CPython)
+        if getattr(opc, "findlabels", None) is not None and not hasattr(opc.findlabels, "_orig"):
+            opc.findlabels = _fast_findlabels(opc.findlabels)
         fmt = getattr(opc, "opcode_arg_fmt", None)
         if isinstance(fmt, dict):
             for name, fn in list(fmt.items()):
@@ -313,31 +443,64 @@ def _opnames(code, version):
 
 def validate_code(code, version) -> bool:
     """Heuristically check that ``code`` really is ``version`` bytecode."""
+    try:
+        return all(_valid_one(c, version) for c in iter_code_objects(code))
+    except Exception:
+        return False
+
+
+def _valid_one(c, version) -> bool:
+    """validate_code for one code object, not its nested ones."""
     opc = opcode_module(version)
     jump_ops = set(getattr(opc, "JUMP_OPS", None) or getattr(opc, "JUMP_OPs", ()) or ())
     max_cmp = 6 if version >= (3, 9) else 11
     cmp_shift = 5 if version >= (3, 13) else 4 if version >= (3, 12) else 0
     try:
-        for c in iter_code_objects(code):
-            n = len(c.co_code)
-            if n == 0 or n % 2:
+        n = len(c.co_code)
+        if n == 0 or n % 2:
+            return False
+        nconst, nnames = len(c.co_consts), len(c.co_names)
+        for ins in get_instructions_bytes(c, opc):
+            name = ins.opname
+            if name.startswith("<") or name in ("INVALID", "ILLEGAL"):
                 return False
-            nconst, nnames = len(c.co_consts), len(c.co_names)
-            for ins in get_instructions_bytes(c, opc):
-                name = ins.opname
-                if name.startswith("<") or name in ("INVALID", "ILLEGAL"):
-                    return False
-                if name == "LOAD_CONST" and ins.arg is not None and ins.arg >= nconst:
-                    return False
-                if name in ("LOAD_NAME", "STORE_NAME", "IMPORT_NAME") and ins.arg is not None and ins.arg >= nnames:
-                    return False
-                if name == "COMPARE_OP" and ins.arg is not None and (ins.arg >> cmp_shift) >= max_cmp:
-                    return False
-                if ins.opcode in jump_ops and isinstance(ins.argval, int) and not (0 <= ins.argval <= n):
-                    return False
+            if name == "LOAD_CONST" and ins.arg is not None and ins.arg >= nconst:
+                return False
+            if name in ("LOAD_NAME", "STORE_NAME", "IMPORT_NAME") and ins.arg is not None and ins.arg >= nnames:
+                return False
+            if name == "COMPARE_OP" and ins.arg is not None and (ins.arg >> cmp_shift) >= max_cmp:
+                return False
+            if ins.opcode in jump_ops and isinstance(ins.argval, int) and not (0 <= ins.argval <= n):
+                return False
     except Exception:
         return False
     return True
+
+
+def trim_junk(code, version):
+    """Drop anti-decompiler padding (random bytes after the last RETURN_VALUE, often an odd count) from every
+    code object, 3.6-3.10 wordcode only. CPython never executes it. None when that doesn't make it valid."""
+    if not (3, 6) <= tuple(version[:2]) <= (3, 10):
+        return None
+    ret = opcode_module(version).opmap.get("RETURN_VALUE")
+    consts, changed = [], False
+    for k in code.co_consts:
+        if is_code(k) and not validate_code(k, version):
+            k = trim_junk(k, version)
+            if k is None:
+                return None
+            changed = True
+        consts.append(k)
+    c = code.replace(co_consts=tuple(consts)) if changed else code
+    if _valid_one(c, version):
+        return c
+    co = bytes(c.co_code)
+    for p in range((len(co) - 2) & ~1, -1, -2):
+        if co[p] == ret:
+            t = c.replace(co_code=co[:p + 2])
+            if _valid_one(t, version):
+                return t
+    return None
 
 
 def _linetable_spans_code(code) -> bool:
@@ -380,10 +543,28 @@ def detect_marshal(raw: bytes, hint=None) -> CodeBlob | None:
             continue
         if used == len(raw) and is_code(code) and validate_code(code, v):
             cands[v] = code
+    trimmed = False
+    if not cands:  # junk-padded bytecode: valid once the bytes after the last return are dropped
+        for v in CANDIDATE_VERSIONS:
+            try:
+                code, used = unmarshal(raw, v)
+                t = trim_junk(code, v) if used == len(raw) and is_code(code) else None
+            except Exception:
+                continue
+            if t is not None:
+                cands[v] = t
+        trimmed = bool(cands)
     if not cands:
         return None
     v, possible = _disambiguate(cands, hint)
     meta = {"detected": True}
+    if trimmed:
+        # the decompiler reads the marshal bytes, so cut the padding there too
+        orig, _ = unmarshal(raw, v)
+        for old, new in zip(iter_code_objects(orig), iter_code_objects(cands[v])):
+            if len(old.co_code) != len(new.co_code):
+                raw = _replace_co_code(raw, bytes(old.co_code), bytes(new.co_code)) or raw
+        meta["junk_trimmed"] = True
     if len(possible) > 1:
         meta["ambiguous"] = [vstr(x) for x in possible]
     return CodeBlob(code=cands[v], version=v, raw=raw, meta=meta)
@@ -618,6 +799,23 @@ def string_constants(code, min_len=1):
             elif isinstance(k, (tuple, frozenset, list)):
                 stack.extend(k)
     return out
+
+
+def keyed_blobs(code, min_blob, max_keys=24):
+    """(blob, candidate keys) per code object: its big str/bytes constants, each with the short ones
+    (4..256 chars) of the same code object, then of the module, then one-byte int constants, as XOR keys."""
+    def strs(c):
+        return [k for k in c.co_consts if isinstance(k, (str, bytes)) and 4 <= len(k) <= 256]
+
+    module_keys = strs(code)
+    pairs = []
+    for c in iter_code_objects(code):
+        big = [k for k in c.co_consts if isinstance(k, (str, bytes)) and len(k) >= min_blob and len(k) > 256]
+        if big:
+            ints = [k for k in c.co_consts if type(k) is int and 1 <= k <= 255]
+            keys = list(dict.fromkeys(strs(c) + module_keys))[:max_keys] + list(dict.fromkeys(ints))[:16]
+            pairs.extend((b, keys) for b in big)
+    return pairs
 
 
 def code_size_estimate(code) -> int:

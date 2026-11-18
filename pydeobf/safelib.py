@@ -65,6 +65,17 @@ class SysModules(dict):
     helpers, injected by a packer) give an opaque value instead of KeyError; membership
     tests (`'pdb' in sys.modules`) still see only what was put there."""
 
+    # what a fresh CPython has loaded before the script runs; len(sys.modules) < 10 is an "emulated / sandboxed" tell
+    STARTUP = ("sys", "builtins", "_frozen_importlib", "_imp", "_thread", "_warnings", "_weakref", "_io", "marshal",
+               "_frozen_importlib_external", "time", "zipimport", "_codecs", "codecs", "encodings.aliases", "encodings",
+               "encodings.utf_8", "_signal", "_abc", "abc", "io", "__main__", "_stat", "stat", "_collections_abc",
+               "genericpath", "os.path", "os", "_sitebuiltins", "site")
+
+    @classmethod
+    def startup(cls, platform):
+        osmod, pathmod = ("nt", "ntpath") if platform == "windows" else ("posix", "posixpath")
+        return cls({k: _vm.Opaque(f"sys.modules[{k!r}]") for k in cls.STARTUP + (osmod, pathmod)})
+
     def __missing__(self, key):
         return _vm.Opaque(f"sys.modules[{key!r}]")
 
@@ -230,6 +241,129 @@ def gzip_decompress(data):
     return _bounded(lambda: zlib.decompressobj(31), data, "zlib")
 
 
+class MemFile(_vm.FakeFile):
+    """io.BytesIO / io.StringIO: an in-memory file that can also be written."""
+
+    ALLOWED = _vm.FakeFile.ALLOWED | {"write", "getvalue", "getbuffer", "readable", "writable", "seekable", "flush"}
+
+    def __init__(self, initial=b"", name="<BytesIO>"):
+        super().__init__(initial, name)
+
+    def write(self, s):
+        if type(s) is not type(self.data) and not (isinstance(s, (bytes, bytearray)) and isinstance(self.data, bytes)):
+            raise _vm.VMRaise(TypeError("a bytes-like object is required" if isinstance(self.data, bytes)
+                                        else "string argument expected"))
+        s = bytes(s) if isinstance(s, bytearray) else s
+        if len(self.data) + len(s) > MAX_OUT:
+            raise _vm.VMStop("in-memory file too large")
+        self.data = self.data[:self.pos] + s + self.data[self.pos + len(s):]
+        self.pos += len(s)
+        return len(s)
+
+    def getvalue(self):
+        return self.data
+
+    def getbuffer(self):
+        return self.data
+
+    def readable(self):
+        return True
+
+    writable = seekable = readable
+
+    def flush(self):
+        pass
+
+
+def io_bytesio(initial_bytes=b""):
+    return MemFile(bytes(initial_bytes or b""), "<BytesIO>")
+
+
+def io_stringio(initial_value="", newline="\n"):
+    return MemFile(str(initial_value or ""), "<StringIO>")
+
+
+def gzip_file(filename=None, mode=None, compresslevel=9, fileobj=None, mtime=None):
+    """gzip.GzipFile / gzip.open for reading an in-memory file (what loaders do with embedded data)."""
+    src = fileobj if fileobj is not None else filename
+    if not isinstance(src, _vm.FakeFile) or (mode is not None and "r" not in str(mode)):
+        raise _vm.VMUnsupported("gzip on a real file or for writing")
+    data = src.read()
+    out = gzip_decompress(data if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1"))
+    if mode is not None and "t" in str(mode):
+        return MemFile(out.decode("utf-8"), "<gzip>")
+    return MemFile(out, "<gzip>")
+
+
+_allow(io_bytesio, io_stringio, gzip_file)
+
+
+# ctypes, only as far as "native" helpers that are really Python: @CFUNCTYPE(...) callbacks over
+# (c_ubyte * n)(*data) buffers, used to hide an XOR / integrity check from decompilers.
+# Everything else in ctypes stays opaque (windll calls go through ENV_PROBES).
+
+class CFuncProto(_vm.HelperObject):
+    """CFUNCTYPE(restype, *argtypes): wrapping a Python function gives back that function."""
+
+    ALLOWED = frozenset({"__call__"})
+
+    def __init__(self, name):
+        self.name = name
+
+    def __call__(self, fn=None, *rest):
+        if isinstance(fn, _vm.VMFunction) and not rest:
+            return fn
+        return _vm.Opaque(f"ctypes.{self.name}()()")
+
+
+class CByteType(_vm.HelperObject):
+    """c_ubyte / c_char / ...: only ``type * n`` (an array type) is modelled."""
+
+    ALLOWED = frozenset()
+
+    def __init__(self, name):
+        self.name = name
+
+    def __mul__(self, n):
+        if not isinstance(n, int) or not 0 <= n <= MAX_OUT:
+            raise _vm.VMRaise(TypeError("can't multiply sequence by non-int"))
+        return CByteArrayType(self.name, n)
+
+    __rmul__ = __mul__
+
+    def __repr__(self):
+        return f"<class 'ctypes.{self.name}'>"
+
+
+class CByteArrayType(_vm.HelperObject):
+    ALLOWED = frozenset({"__call__"})
+
+    def __init__(self, name, n):
+        self.name, self.n = name, n
+
+    def __call__(self, *vals):
+        if len(vals) > self.n:
+            raise _vm.VMRaise(IndexError("invalid index"))
+        out = bytearray(self.n)
+        for i, v in enumerate(vals):
+            out[i] = v[0] if isinstance(v, (bytes, bytearray)) and len(v) == 1 else v & 0xFF if isinstance(v, int) else 0
+        return out
+
+
+def ctypes_cast(obj, typ=None):
+    if isinstance(obj, bytearray):  # a byte buffer stays indexable through POINTER(c_ubyte)
+        return obj
+    return _vm.Opaque("ctypes.cast()")
+
+
+def _ctypes_module():
+    # emulator builtins, not host calls: their arguments are opaque ctypes types (c_int, POINTER(...))
+    protos = {n: _vm.Special(n, lambda *types_, _n=n, **kw: CFuncProto(_n), "ctypes")
+              for n in ("CFUNCTYPE", "WINFUNCTYPE", "PYFUNCTYPE")}
+    return {**protos, "cast": _vm.Special("cast", ctypes_cast, "ctypes"),
+            **{n: CByteType(n) for n in ("c_ubyte", "c_byte", "c_char", "c_uint8", "c_int8")}}
+
+
 class StreamDecompressor(_vm.HelperObject):
     """zlib.decompressobj() / bz2.BZ2Decompressor() / lzma.LZMADecompressor(), output capped at MAX_OUT."""
 
@@ -374,6 +508,7 @@ ENV_PROBES = {
     "multiprocessing.cpu_count": 8, "os.cpu_count": 8,
     "os.getpid": 4242, "os.getppid": 4100, "os.getlogin": "user", "getpass.getuser": "user",
     "traceback.format_stack": [], "traceback.extract_stack": [],
+    "sys.monitoring.get_tool": None, "sys.getprofile": None,  # no profiler / sys.monitoring tool attached
     "platform.version": {"windows": "10.0.19045", "linux": "#1 SMP PREEMPT_DYNAMIC"},
     "platform.platform": {"windows": "Windows-10-10.0.19045-SP0", "linux": "Linux-6.5.0-x86_64-with-glibc2.35"},
     "platform.processor": {"windows": "Intel64 Family 6 Model 158 Stepping 10, GenuineIntel", "linux": "x86_64"},
@@ -445,7 +580,10 @@ def _static_modules(platform):
         "bz2": {"compress": bz2.compress, "decompress": bz2_decompress, "BZ2Decompressor": bz2_decompressor},
         "lzma": {"compress": lzma.compress, "decompress": lzma_decompress, "LZMADecompressor": lzma_decompressor,
                  **_pick(lzma, ["FORMAT_AUTO", "FORMAT_XZ", "FORMAT_ALONE", "FORMAT_RAW", "LZMAError"])},
-        "gzip": {"decompress": gzip_decompress, "compress": __import__("gzip").compress},
+        "gzip": {"decompress": gzip_decompress, "compress": __import__("gzip").compress,
+                 "GzipFile": gzip_file, "open": gzip_file},
+        "io": {"BytesIO": io_bytesio, "StringIO": io_stringio},
+        "ctypes": _ctypes_module(),
         "binascii": _pick(binascii, ["unhexlify", "hexlify", "a2b_base64", "b2a_base64", "a2b_hex", "b2a_hex",
                                      "crc32", "a2b_uu", "b2a_uu", "a2b_qp", "b2a_qp", "crc_hqx", "Error"]),
         "codecs": {**_pick(codecs, ["encode", "BOM_UTF8", "lookup"]), "decode": codecs_decode},
@@ -572,13 +710,19 @@ def get_module(vm, name):
         mod = _vm.SafeModule("marshal", {"loads": _vm.Special("loads", vm.marshal_loads, "marshal"),
                                          "dumps": _vm.Special("dumps", vm.marshal_dumps, "marshal"),
                                          "load": _vm.Special("load", lambda f: vm.marshal_loads(f.read()))})
+    elif name in ("pickle", "_pickle", "cPickle", "dill", "cloudpickle"):
+        from . import safepickle
+        mod = _vm.SafeModule(name, {
+            "loads": _vm.Special("loads", lambda data, *a, _n=name, **k: safepickle.loads(vm, data, _n), name),
+            "load": _vm.Special("load", lambda f, *a, _n=name, **k: safepickle.loads(vm, vm.call(
+                vm.getattr(f, "read"), (), {}), _n), name)})
     elif name == "sys":
         version_info, version_str, hexversion = _sys_version(version)
         mod = _vm.SafeModule("sys", {
             "version_info": version_info, "version": version_str, "hexversion": hexversion,
             "platform": "win32" if vm.platform == "windows" else "linux", "argv": [vm.script_name],
             "maxsize": sys.maxsize, "byteorder": "little", "executable": "python",
-            "exit": vm.builtins["exit"], "modules": SysModules(), "flags": _vm.Opaque("sys.flags"),
+            "exit": vm.builtins["exit"], "modules": SysModules.startup(vm.platform), "flags": _vm.Opaque("sys.flags"),
             "getrecursionlimit": _vm.Special("getrecursionlimit", lambda: 1000),
             # no debugger/profiler attached: anti-debug checks take the normal path
             "gettrace": _vm.Special("gettrace", lambda: None),
@@ -630,11 +774,17 @@ def get_module(vm, name):
         def _ns():
             return int(_t() * 1e9)
 
+        def _sleep(s=0):
+            # advance the virtual clock (not wall time): `t = time(); sleep(x); assert time() - t >= x` timing checks
+            vm.event(f"time.sleep({_vm.describe(s)})")
+            if isinstance(s, (int, float)) and not isinstance(s, bool) and 0 < s < 1e7:
+                clock[0] += s
+
         mod = _vm.SafeModule("time", {
             "time": _vm.Special("time", _t), "perf_counter": _vm.Special("perf_counter", _t),
             "monotonic": _vm.Special("monotonic", _t), "process_time": _vm.Special("process_time", _t),
             **{n: _vm.Special(n, _ns) for n in ("time_ns", "perf_counter_ns", "monotonic_ns", "process_time_ns")},
-            "sleep": _vm.Special("sleep", lambda s=0: vm.event(f"time.sleep({_vm.describe(s)})")),
+            "sleep": _vm.Special("sleep", _sleep),
         })
     elif name == "types":
         mod = _vm.SafeModule("types", {
@@ -698,8 +848,16 @@ def make_builtins(vm):
                 parts.append("<?>")
         vm.event("print: " + V.describe(sep.join(parts) if isinstance(sep, str) else " ".join(parts), 300))
 
+    input_seen = {}
+
     def _input(prompt=""):
         vm.event(f"input({V.describe(prompt)})")
+        # first answers: the user presses Enter. Asked again at the same place (a menu / retry loop that
+        # rejects ""): the answer is unknown, so the branch logic picks a way out instead of looping forever
+        key = (id(vm.frame.code) if vm.frame else 0, V.describe(prompt, 80))
+        input_seen[key] = input_seen.get(key, 0) + 1
+        if input_seen[key] > 2:
+            return V.Unknown("input()")
         return ""
 
     def _globals():
